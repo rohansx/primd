@@ -1,0 +1,15 @@
+[package]
+name = "primd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Sub-millisecond predictive retrieval runtime for voice AI"
+
+[dependencies]
+bytemuck.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+memmap2.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

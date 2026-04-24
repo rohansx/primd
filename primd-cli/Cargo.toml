@@ -1,0 +1,13 @@
+[package]
+name = "primd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for primd: index, train, serve, benchmark"
+
+[[bin]]
+name = "primd"
+path = "src/main.rs"
+
+[dependencies]
+primd-core = { path = "../primd-core" }

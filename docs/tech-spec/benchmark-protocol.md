@@ -1,0 +1,157 @@
+# Benchmark Protocol
+
+Everything in this document will be reproducible via `make bench` from the `primd-bench/` directory.
+
+## Hardware
+
+| Label | Instance | CPU | RAM | SIMD |
+|---|---|---|---|---|
+| Server | AWS c6i.4xlarge | 8-core Ice Lake | 32 GB | AVX-512 + VPOPCNTDQ |
+| On-device | Apple M3 MacBook Pro | 8+4 cores | 18 GB | NEON |
+| Browser | Chrome 126 on M3 | WASM SIMD | 4 GB (tab limit) | 128-bit |
+
+## Corpora
+
+### 1. MS-MARCO Passage (Standard IR Benchmark)
+
+- 8.8M passages, standard in information retrieval research
+- Used for absolute recall and latency numbers at scale
+- Pre-embedded with MiniLM-L6-v2
+
+### 2. BEIR (Zero-Shot Eval)
+
+- 18 datasets across diverse domains
+- Tests generalization without domain-specific training
+- Measures recall degradation from binary quantization
+
+### 3. Synthetic SDR Dialogue Corpus (Voice-Specific)
+
+- Built from public Gong call transcripts + MultiWOZ
+- ~50K simulated sales conversations
+- 20 turns per conversation average
+- Annotated with topic labels and transition points
+- **Released with primd** under CC-BY-4.0
+- This corpus is the primary benchmark for layers 3-4 (prediction, caching)
+
+## Baselines
+
+| System | Configuration | Notes |
+|---|---|---|
+| FAISS HNSW | In-process, AVX-512, ef_search=64, M=16 | Same machine as primd |
+| Qdrant | Self-hosted, localhost, gRPC, HNSW default config | Docker on same machine |
+| Pinecone | Managed (us-east-1), includes network latency | Realistic production setup |
+| Moss | Replicated config: in-process, WASM-compatible | Best-effort reproduction |
+| VoiceAgentRAG | Exact published config, FAISS cache, GPT-4o-mini predictor | Includes LLM prediction cost |
+
+All baselines run on the same hardware (c6i.4xlarge) except Pinecone (managed).
+
+## Metrics
+
+### Latency
+
+- **p50, p95, p99, p999** — measured per-query, in microseconds
+- **Cold-start latency** — time from `Index::open()` to first query completing
+- **Warm-up latency** — time until p99 stabilizes (mmap pages faulted in)
+- Measured with `criterion` (Rust) for microbenchmarks, custom harness for end-to-end
+
+### Throughput
+
+- **QPS at p99 < 2ms** — maximum queries per second while maintaining target latency
+- **QPS at p99 < 5ms** — relaxed target for comparison with slower baselines
+
+### Recall
+
+- **recall@10** at equal-recall target across all systems
+- **recall@10 vs flat fp32 brute-force** — measures quantization loss
+- Measured on MS-MARCO and BEIR test sets
+
+### Prediction (Layers 3-4 Specific)
+
+- **Cache hit rate** — % of queries served from layer 3 or 4 cache
+- **Per-scenario hit rate** — broken down by conversation type (sales, support, etc.)
+- **False positive rate** — % of cache hits that returned wrong/irrelevant results
+- **Prediction accuracy** — % of prefetched events that were actually queried next
+
+### Memory
+
+- **RSS** — resident set size during steady-state operation
+- **Hot working set** — pages actively accessed (via `perf` page fault tracking)
+- **Index size on disk** — total bytes, broken down by component
+
+## Benchmark Scenarios
+
+### Scenario 1: Single-Query Latency (All Systems)
+
+```
+For each query in test set:
+    measure: embed_time + search_time + total_time
+Report: p50, p95, p99, p999
+```
+
+This is the apples-to-apples comparison. Every system gets the same queries, measured the same way.
+
+### Scenario 2: Conversational Sequence (primd + VoiceAgentRAG)
+
+```
+For each conversation in SDR corpus:
+    for each turn:
+        measure: retrieval_time, cache_hit, layer_served
+    report: per-turn latency, cumulative cache hit rate, cache hit rate by turn position
+```
+
+This measures the predictive advantage. Only primd and VoiceAgentRAG are designed for this pattern.
+
+### Scenario 3: Scale Sweep
+
+```
+For corpus sizes [10K, 100K, 500K, 1M, 5M]:
+    measure: p50, p99, QPS, memory
+    report: scaling curve for each system
+```
+
+Tests how each system degrades with scale.
+
+### Scenario 4: WASM Performance
+
+```
+On Chrome (M3):
+    for corpus sizes [1K, 10K, 50K, 100K]:
+        measure: p50, p99, memory, initialization time
+    compare: primd-wasm vs sqlite-vec-wasm vs brute-force
+```
+
+## Reproducibility
+
+```bash
+# Clone and setup
+git clone https://github.com/rohansx/primd
+cd primd/primd-bench
+
+# Download corpora (automated)
+make corpora
+
+# Stand up all baselines (Docker)
+docker-compose up -d
+
+# Run all benchmarks
+make bench
+
+# Generate report
+make report
+# → produces bench-report.md with tables and charts
+
+# Run specific benchmark
+make bench-latency       # scenario 1
+make bench-conversational # scenario 2
+make bench-scale         # scenario 3
+make bench-wasm          # scenario 4
+```
+
+## Reporting
+
+Benchmark results are published as:
+
+1. **Tables in README** — headline numbers (p50, p99, recall, cache hit rate)
+2. **bench-report.md** — full detailed report with all scenarios
+3. **Raw data** — JSON files in `primd-bench/results/` for independent analysis
+4. **Flamegraphs** — CPU profiles for primd's hot paths (generated by `make profile`)
