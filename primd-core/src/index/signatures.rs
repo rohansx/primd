@@ -137,6 +137,119 @@ impl SignatureIndex {
         heap.into_sorted_vec()
     }
 
+    /// Scan only a subset of indices, returning the top-K nearest.
+    ///
+    /// Uses the same SIMD path as a full scan by gathering the requested
+    /// signatures into a contiguous scratch buffer first. The gather adds
+    /// O(|indices|) memory traffic, but for the common case where indices
+    /// span contiguous event slices, the OS prefetcher handles it well and
+    /// the SIMD throughput on the scan dominates.
+    pub fn scan_top_k_subset(
+        &self,
+        query: &BinarySignature,
+        indices: &[usize],
+        k: usize,
+    ) -> Vec<(u32, usize)> {
+        if k == 0 || indices.is_empty() {
+            return Vec::new();
+        }
+        let sigs = self.as_slice();
+
+        // Gather subset into a contiguous buffer. Skip out-of-range indices.
+        let mut packed: Vec<BinarySignature> = Vec::with_capacity(indices.len());
+        let mut backref: Vec<usize> = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            if idx < sigs.len() {
+                packed.push(sigs[idx]);
+                backref.push(idx);
+            }
+        }
+        if packed.is_empty() {
+            return Vec::new();
+        }
+
+        let mut local_heap = TopKHeap::new(k);
+        match simd_level() {
+            #[cfg(target_arch = "x86_64")]
+            SimdLevel::Avx512 => unsafe {
+                scan_avx512(query, &packed, &mut local_heap);
+            },
+            #[cfg(target_arch = "x86_64")]
+            SimdLevel::Avx2 => unsafe {
+                scan_avx2(query, &packed, &mut local_heap);
+            },
+            SimdLevel::Scalar => scan_scalar(query, &packed, &mut local_heap),
+        }
+
+        // Map packed-buffer indices back to original corpus indices.
+        local_heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(dist, packed_idx)| (dist, backref[packed_idx]))
+            .collect()
+    }
+
+    /// Parallel variant of `scan_top_k_subset`. Worth using when the subset
+    /// is large enough (>~10K signatures) to amortize rayon overhead.
+    pub fn scan_top_k_subset_parallel(
+        &self,
+        query: &BinarySignature,
+        indices: &[usize],
+        k: usize,
+    ) -> Vec<(u32, usize)> {
+        if k == 0 || indices.is_empty() {
+            return Vec::new();
+        }
+        let sigs = self.as_slice();
+
+        let mut packed: Vec<BinarySignature> = Vec::with_capacity(indices.len());
+        let mut backref: Vec<usize> = Vec::with_capacity(indices.len());
+        for &idx in indices {
+            if idx < sigs.len() {
+                packed.push(sigs[idx]);
+                backref.push(idx);
+            }
+        }
+        if packed.is_empty() {
+            return Vec::new();
+        }
+
+        let chunk_size = (packed.len() / rayon::current_num_threads()).max(512);
+        let heap = packed
+            .par_chunks(chunk_size)
+            .enumerate()
+            .map(|(chunk_idx, chunk)| {
+                let offset = chunk_idx * chunk_size;
+                let mut local_heap = TopKHeap::new(k);
+                match simd_level() {
+                    #[cfg(target_arch = "x86_64")]
+                    SimdLevel::Avx512 => unsafe {
+                        scan_avx512_offset(query, chunk, &mut local_heap, offset);
+                    },
+                    #[cfg(target_arch = "x86_64")]
+                    SimdLevel::Avx2 => unsafe {
+                        scan_avx2_offset(query, chunk, &mut local_heap, offset);
+                    },
+                    SimdLevel::Scalar => {
+                        scan_scalar_offset(query, chunk, &mut local_heap, offset);
+                    }
+                }
+                local_heap
+            })
+            .reduce(
+                || TopKHeap::new(k),
+                |mut a, b| {
+                    a.merge(b);
+                    a
+                },
+            );
+
+        heap.into_sorted_vec()
+            .into_iter()
+            .map(|(dist, packed_idx)| (dist, backref[packed_idx]))
+            .collect()
+    }
+
     /// Parallel scan using rayon. Splits work across threads, merges results.
     pub fn scan_top_k_parallel(&self, query: &BinarySignature, k: usize) -> Vec<(u32, usize)> {
         if k == 0 || self.is_empty() {
@@ -404,7 +517,7 @@ mod tests {
         let dir = std::env::temp_dir().join("primd_test_sigs_bad");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bad.bin");
-        std::fs::write(&path, &[0u8; 33]).unwrap(); // not a multiple of 32
+        std::fs::write(&path, [0u8; 33]).unwrap(); // not a multiple of 32
 
         assert!(SignatureIndex::from_file(&path).is_err());
         std::fs::remove_dir_all(&dir).ok();

@@ -5,10 +5,12 @@
 
 pub mod embed;
 pub mod index;
+pub mod predict;
 
 pub use embed::binary::{BinarySignature, PcaProjector};
 pub use index::heap::TopKHeap;
 pub use index::signatures::SignatureIndex;
+pub use predict::{ConversationState, EventId};
 
 /// Crate-level error type.
 #[derive(Debug, thiserror::Error)]
