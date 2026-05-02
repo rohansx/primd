@@ -4,11 +4,12 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use primd_core::embed::{Embedder, EmbeddingPipeline, HashedEmbedder};
+use primd_core::embed::{EmbeddingPipeline, HashedEmbedder, OpenAIEmbedder};
 use primd_core::index::signatures::SignatureIndex;
+use primd_core::{BinarySignature, PrimdError};
 
 #[derive(Args, Debug)]
 pub struct IndexArgs {
@@ -20,14 +21,31 @@ pub struct IndexArgs {
     #[arg(short, long)]
     pub out: PathBuf,
 
-    /// Embedding dimension. 256 = direct quantize (no PCA needed). Other
-    /// values are accepted and would be used with a PCA projector down the line.
+    /// Embedder backend.
+    #[arg(long, value_enum, default_value_t = EmbedderKind::Hashed)]
+    pub embedder: EmbedderKind,
+
+    /// Embedding dimension. 256 = direct quantize (no PCA needed).
     #[arg(long, default_value_t = 256)]
     pub dim: usize,
 
     /// Disable bigram features in the hashed embedder.
     #[arg(long)]
     pub no_bigrams: bool,
+
+    /// OpenAI model name (default `text-embedding-3-small`).
+    #[arg(long)]
+    pub openai_model: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbedderKind {
+    /// Deterministic feature-hashing baseline. No network, no model.
+    Hashed,
+    /// OpenAI text embeddings (`text-embedding-3-small` by default).
+    /// Requires `OPENAI_API_KEY` in the environment.
+    Openai,
 }
 
 #[derive(Deserialize, Debug)]
@@ -40,68 +58,45 @@ struct CorpusEntry {
 
 #[derive(Serialize)]
 struct Manifest {
-    embedder: String,
+    embedder: EmbedderKind,
     dim: usize,
     use_bigrams: bool,
+    openai_model: Option<String>,
     n_entries: usize,
     ids: Vec<String>,
-    /// Map: event name → list of corpus indices belonging to that event. Used
-    /// by the prefetch coordinator to narrow the search scope per event.
     scope: BTreeMap<String, Vec<usize>>,
 }
 
 pub fn run(args: IndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     if args.dim != 256 {
         return Err(format!(
-            "dim={} not yet supported; only 256 (direct quantize) is wired up. \
-             Higher dims need a fitted PcaProjector — coming next iteration.",
+            "dim={} not yet supported; only 256 (direct quantize) is wired up",
             args.dim
         )
         .into());
     }
 
     std::fs::create_dir_all(&args.out)?;
-
-    let file = File::open(&args.input)?;
-    let reader = BufReader::new(file);
-
-    let mut entries: Vec<CorpusEntry> = Vec::new();
-    for (lineno, line) in reader.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: CorpusEntry =
-            serde_json::from_str(&line).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
-        entries.push(entry);
-    }
-    if entries.is_empty() {
-        return Err("input contained no entries".into());
-    }
-
-    let mut embedder = HashedEmbedder::new(args.dim);
-    if args.no_bigrams {
-        embedder = embedder.without_bigrams();
-    }
-    let pipeline = EmbeddingPipeline::new_direct(embedder)?;
+    let entries = read_jsonl(&args.input)?;
 
     let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
 
     let started = Instant::now();
-    let signatures = pipeline.embed_batch_to_signatures(&texts)?;
+    let signatures = match args.embedder {
+        EmbedderKind::Hashed => embed_hashed(args.dim, !args.no_bigrams, &texts)?,
+        EmbedderKind::Openai => embed_openai(args.dim, args.openai_model.as_deref(), &texts)?,
+    };
     let elapsed = started.elapsed();
 
     let throughput = entries.len() as f64 / elapsed.as_secs_f64();
-    let dim = pipeline.embedder().dim();
     eprintln!(
-        "indexed {} entries in {:.2}ms ({:.0} docs/s, dim={})",
+        "indexed {} entries via {:?} in {:.1}ms ({:.0} docs/s)",
         entries.len(),
+        args.embedder,
         elapsed.as_secs_f64() * 1000.0,
         throughput,
-        dim
     );
 
-    // Group corpus indices by event for layer 3 prefetch scopes.
     let mut scope: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, entry) in entries.iter().enumerate() {
         let key = entry
@@ -111,14 +106,14 @@ pub fn run(args: IndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         scope.entry(key).or_default().push(i);
     }
 
-    // Write outputs.
     let sigs_path = args.out.join("signatures.bin");
     SignatureIndex::new(signatures).write_to_file(&sigs_path)?;
 
     let manifest = Manifest {
-        embedder: "hashed".to_string(),
+        embedder: args.embedder,
         dim: args.dim,
         use_bigrams: !args.no_bigrams,
+        openai_model: args.openai_model,
         n_entries: entries.len(),
         ids: entries.iter().map(|e| e.id.clone()).collect(),
         scope,
@@ -133,4 +128,56 @@ pub fn run(args: IndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         manifest_path.display()
     );
     Ok(())
+}
+
+fn read_jsonl(path: &PathBuf) -> Result<Vec<CorpusEntry>, Box<dyn std::error::Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut entries: Vec<CorpusEntry> = Vec::new();
+    for (lineno, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: CorpusEntry =
+            serde_json::from_str(&line).map_err(|e| format!("line {}: {}", lineno + 1, e))?;
+        entries.push(entry);
+    }
+    if entries.is_empty() {
+        return Err("input contained no entries".into());
+    }
+    Ok(entries)
+}
+
+fn embed_hashed(
+    dim: usize,
+    use_bigrams: bool,
+    texts: &[&str],
+) -> Result<Vec<BinarySignature>, PrimdError> {
+    let mut e = HashedEmbedder::new(dim);
+    if !use_bigrams {
+        e = e.without_bigrams();
+    }
+    let pipe = EmbeddingPipeline::new_direct(e)?;
+    pipe.embed_batch_to_signatures(texts)
+}
+
+fn embed_openai(
+    dim: usize,
+    model: Option<&str>,
+    texts: &[&str],
+) -> Result<Vec<BinarySignature>, PrimdError> {
+    let mut e = OpenAIEmbedder::from_env()?.with_dim(dim);
+    if let Some(m) = model {
+        e = e.with_model(m);
+    }
+    let pipe = EmbeddingPipeline::new_direct(e)?;
+    // The OpenAI API accepts up to 2048 inputs per request; chunk to be safe.
+    const BATCH: usize = 256;
+    let mut out: Vec<BinarySignature> = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(BATCH) {
+        let part = pipe.embed_batch_to_signatures(chunk)?;
+        out.extend(part);
+    }
+    Ok(out)
 }

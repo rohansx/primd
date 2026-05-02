@@ -22,6 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::embedder::Embedder;
+use crate::Result;
 
 const DEFAULT_HASH_BANDS: usize = 4;
 
@@ -105,7 +106,7 @@ impl Embedder for HashedEmbedder {
         self.dim
     }
 
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
         let mut tokens = tokenize(text);
         if self.drop_stopwords {
             tokens.retain(|t| !is_stopword(t));
@@ -124,7 +125,7 @@ impl Embedder for HashedEmbedder {
         }
 
         l2_normalize(&mut acc);
-        acc
+        Ok(acc)
     }
 }
 
@@ -166,17 +167,17 @@ mod tests {
     #[test]
     fn deterministic_across_calls() {
         let e = HashedEmbedder::new(256);
-        let a = e.embed("how much does the premium plan cost");
-        let b = e.embed("how much does the premium plan cost");
+        let a = e.embed("how much does the premium plan cost").unwrap();
+        let b = e.embed("how much does the premium plan cost").unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn similar_texts_have_higher_cosine_than_dissimilar() {
         let e = HashedEmbedder::new(512);
-        let q = e.embed("how much does the premium plan cost");
-        let close = e.embed("what is the cost of premium plans");
-        let far = e.embed("the weather in tokyo is sunny today");
+        let q = e.embed("how much does the premium plan cost").unwrap();
+        let close = e.embed("what is the cost of premium plans").unwrap();
+        let far = e.embed("the weather in tokyo is sunny today").unwrap();
         let close_sim = cosine_similarity(&q, &close);
         let far_sim = cosine_similarity(&q, &far);
         assert!(
@@ -188,7 +189,7 @@ mod tests {
     #[test]
     fn empty_text_returns_zero_vector() {
         let e = HashedEmbedder::new(64);
-        let v = e.embed("");
+        let v = e.embed("").unwrap();
         assert!(v.iter().all(|&x| x == 0.0));
     }
 
@@ -209,21 +210,18 @@ mod tests {
 
     #[test]
     fn bigrams_help_distinguish_word_orders() {
-        // Without bigrams, "dog bites man" and "man bites dog" embed identically.
         let with_bi = HashedEmbedder::new(512);
         let no_bi = HashedEmbedder::new(512).without_bigrams();
 
-        let a = with_bi.embed("dog bites man");
-        let b = with_bi.embed("man bites dog");
+        let a = with_bi.embed("dog bites man").unwrap();
+        let b = with_bi.embed("man bites dog").unwrap();
         let bi_sim = cosine_similarity(&a, &b);
 
-        let a2 = no_bi.embed("dog bites man");
-        let b2 = no_bi.embed("man bites dog");
+        let a2 = no_bi.embed("dog bites man").unwrap();
+        let b2 = no_bi.embed("man bites dog").unwrap();
         let no_bi_sim = cosine_similarity(&a2, &b2);
 
-        // No bigrams → identical bags → cosine = 1.0
         assert!((no_bi_sim - 1.0).abs() < 1e-3);
-        // With bigrams → less similar
         assert!(bi_sim < no_bi_sim);
     }
 
@@ -231,7 +229,7 @@ mod tests {
     fn dim_matches_constructor() {
         for dim in [64, 128, 256, 384, 512] {
             let e = HashedEmbedder::new(dim);
-            assert_eq!(e.embed("test text").len(), dim);
+            assert_eq!(e.embed("test text").unwrap().len(), dim);
             assert_eq!(e.dim(), dim);
         }
     }
@@ -239,7 +237,7 @@ mod tests {
     #[test]
     fn embedding_is_unit_norm() {
         let e = HashedEmbedder::new(256);
-        let v = e.embed("a sentence with several words in it");
+        let v = e.embed("a sentence with several words in it").unwrap();
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-4, "norm should be ~1.0, got {norm}");
     }

@@ -14,9 +14,9 @@ use crate::{PrimdError, Result};
 /// can plug in.
 pub trait Embedder: Send + Sync {
     fn dim(&self) -> usize;
-    fn embed(&self, text: &str) -> Vec<f32>;
+    fn embed(&self, text: &str) -> Result<Vec<f32>>;
 
-    fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
 }
@@ -70,9 +70,18 @@ impl<E: Embedder> EmbeddingPipeline<E> {
     }
 
     pub fn embed_to_signature(&self, text: &str) -> Result<BinarySignature> {
-        let dense = self.embedder.embed(text);
+        let dense = self.embedder.embed(text)?;
+        self.quantize(&dense)
+    }
+
+    pub fn embed_batch_to_signatures(&self, texts: &[&str]) -> Result<Vec<BinarySignature>> {
+        let denses = self.embedder.embed_batch(texts)?;
+        denses.iter().map(|d| self.quantize(d)).collect()
+    }
+
+    fn quantize(&self, dense: &[f32]) -> Result<BinarySignature> {
         match &self.path {
-            SignaturePath::Pca(pca) => pca.quantize(&dense),
+            SignaturePath::Pca(pca) => pca.quantize(dense),
             SignaturePath::Direct => {
                 if dense.len() != 256 {
                     return Err(PrimdError::InvalidDimension {
@@ -81,30 +90,9 @@ impl<E: Embedder> EmbeddingPipeline<E> {
                     });
                 }
                 let mut arr = [0f32; 256];
-                arr.copy_from_slice(&dense);
+                arr.copy_from_slice(dense);
                 Ok(sign_bit_quantize(&arr))
             }
-        }
-    }
-
-    pub fn embed_batch_to_signatures(&self, texts: &[&str]) -> Result<Vec<BinarySignature>> {
-        let denses = self.embedder.embed_batch(texts);
-        match &self.path {
-            SignaturePath::Pca(pca) => denses.iter().map(|d| pca.quantize(d)).collect(),
-            SignaturePath::Direct => denses
-                .iter()
-                .map(|d| {
-                    if d.len() != 256 {
-                        return Err(PrimdError::InvalidDimension {
-                            expected: 256,
-                            got: d.len(),
-                        });
-                    }
-                    let mut arr = [0f32; 256];
-                    arr.copy_from_slice(d);
-                    Ok(sign_bit_quantize(&arr))
-                })
-                .collect(),
         }
     }
 }
@@ -123,8 +111,8 @@ mod tests {
         fn dim(&self) -> usize {
             self.dim
         }
-        fn embed(&self, _: &str) -> Vec<f32> {
-            vec![1.0; self.dim]
+        fn embed(&self, _: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0; self.dim])
         }
     }
 
@@ -152,7 +140,6 @@ mod tests {
         let pipe = EmbeddingPipeline::new_direct(ConstantEmbedder { dim: 256 }).unwrap();
         let s1 = pipe.embed_to_signature("hello").unwrap();
         let s2 = pipe.embed_to_signature("world").unwrap();
-        // Constant embedder produces same vector for any text → same signature.
         assert_eq!(s1, s2);
     }
 

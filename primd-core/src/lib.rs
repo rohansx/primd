@@ -26,6 +26,9 @@ pub enum PrimdError {
 
     #[error("PCA matrix file not found or invalid")]
     PcaMatrixMissing,
+
+    #[error("embedder error: {0}")]
+    Embedder(String),
 }
 
 pub type Result<T> = std::result::Result<T, PrimdError>;

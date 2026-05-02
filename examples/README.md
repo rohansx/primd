@@ -2,22 +2,45 @@
 
 End-to-end demo: text in → primd retrieval → top-K matches.
 
-## Quick start
+## Quick start (deterministic, no network)
 
 ```bash
 # Build the release binary once.
 cargo build --release -p primd-cli
 
-# Index the FAQ corpus.
+# Index the FAQ corpus with the bundled feature-hashing embedder.
 ./target/release/primd index \
   --input examples/faq.jsonl \
-  --out /tmp/primd-faq
+  --out /tmp/primd-faq \
+  --embedder hashed
 
 # Query it.
 ./target/release/primd query \
   --index /tmp/primd-faq \
   --text "is there a free trial"
 ```
+
+## Production retrieval (OpenAI embeddings)
+
+For real semantic recall, swap the embedder. Requires `OPENAI_API_KEY`.
+
+```bash
+export OPENAI_API_KEY=sk-...
+
+./target/release/primd index \
+  --input examples/faq.jsonl \
+  --out /tmp/primd-faq-openai \
+  --embedder openai
+
+./target/release/primd query \
+  --index /tmp/primd-faq-openai \
+  --text "what does the premium plan cost"
+```
+
+primd asks OpenAI for `text-embedding-3-small` with `dimensions=256`, so the
+returned vector is already 256-dim and skips PCA. The retrieval pipeline
+(SignatureIndex, prefetch, delta cache) is unchanged; only the input
+embedder differs.
 
 ## What's wired up
 

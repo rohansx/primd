@@ -6,8 +6,11 @@ use std::time::Instant;
 use clap::Args;
 use serde::Deserialize;
 
-use primd_core::embed::{EmbeddingPipeline, HashedEmbedder};
+use primd_core::embed::{EmbeddingPipeline, HashedEmbedder, OpenAIEmbedder};
 use primd_core::index::signatures::SignatureIndex;
+use primd_core::{BinarySignature, PrimdError};
+
+use crate::cmd_index::EmbedderKind;
 
 #[derive(Args, Debug)]
 pub struct QueryArgs {
@@ -30,9 +33,11 @@ pub struct QueryArgs {
 
 #[derive(Deserialize)]
 struct Manifest {
-    embedder: String,
+    embedder: EmbedderKind,
     dim: usize,
     use_bigrams: bool,
+    #[serde(default)]
+    openai_model: Option<String>,
     n_entries: usize,
     ids: Vec<String>,
     #[serde(default)]
@@ -44,22 +49,8 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     let sigs_path = args.index.join("signatures.bin");
 
     let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-    if manifest.embedder != "hashed" {
-        return Err(format!(
-            "this build only knows how to load 'hashed' indexes; manifest says '{}'",
-            manifest.embedder
-        )
-        .into());
-    }
 
-    // Reconstruct the same embedder used at index time.
-    let mut embedder = HashedEmbedder::new(manifest.dim);
-    if !manifest.use_bigrams {
-        embedder = embedder.without_bigrams();
-    }
-    let pipeline = EmbeddingPipeline::new_direct(embedder)?;
     let index = SignatureIndex::from_file(&sigs_path)?;
-
     if index.len() != manifest.n_entries {
         return Err(format!(
             "manifest says {} entries but signatures.bin has {}",
@@ -82,7 +73,7 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let embed_start = Instant::now();
-    let query_sig = pipeline.embed_to_signature(&query_text)?;
+    let query_sig = embed_query(&manifest, &query_text)?;
     let embed_elapsed = embed_start.elapsed();
 
     let scan_start = Instant::now();
@@ -94,7 +85,8 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     let scan_elapsed = scan_start.elapsed();
 
     eprintln!(
-        "embed: {:.0}us | scan: {:.0}us | corpus: {} sigs",
+        "embedder: {:?} | embed: {:.0}us | scan: {:.0}us | corpus: {} sigs",
+        manifest.embedder,
         embed_elapsed.as_secs_f64() * 1_000_000.0,
         scan_elapsed.as_secs_f64() * 1_000_000.0,
         index.len()
@@ -105,7 +97,6 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Reverse-lookup: corpus index → event name (if any).
     let mut event_for: BTreeMap<usize, String> = BTreeMap::new();
     for (event_name, indices) in &manifest.scope {
         for &i in indices {
@@ -121,4 +112,25 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn embed_query(manifest: &Manifest, text: &str) -> Result<BinarySignature, PrimdError> {
+    match manifest.embedder {
+        EmbedderKind::Hashed => {
+            let mut e = HashedEmbedder::new(manifest.dim);
+            if !manifest.use_bigrams {
+                e = e.without_bigrams();
+            }
+            let pipe = EmbeddingPipeline::new_direct(e)?;
+            pipe.embed_to_signature(text)
+        }
+        EmbedderKind::Openai => {
+            let mut e = OpenAIEmbedder::from_env()?.with_dim(manifest.dim);
+            if let Some(m) = &manifest.openai_model {
+                e = e.with_model(m);
+            }
+            let pipe = EmbeddingPipeline::new_direct(e)?;
+            pipe.embed_to_signature(text)
+        }
+    }
 }
