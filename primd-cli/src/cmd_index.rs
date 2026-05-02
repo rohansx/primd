@@ -7,9 +7,13 @@ use std::time::Instant;
 use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-use primd_core::embed::{EmbeddingPipeline, HashedEmbedder, OpenAIEmbedder};
+use primd_core::embed::{
+    EmbeddingPipeline, HashedEmbedder, LocalEmbedder, LocalModel, OpenAIEmbedder, random_projection,
+};
 use primd_core::index::signatures::SignatureIndex;
 use primd_core::{BinarySignature, PrimdError};
+
+const LOCAL_PROJECTION_SEED: u64 = 0xA17F_C0DE_B007_5EED;
 
 #[derive(Args, Debug)]
 pub struct IndexArgs {
@@ -36,6 +40,28 @@ pub struct IndexArgs {
     /// OpenAI model name (default `text-embedding-3-small`).
     #[arg(long)]
     pub openai_model: Option<String>,
+
+    /// Local model when `--embedder local` is selected.
+    #[arg(long, value_enum, default_value_t = LocalModelKind::BgeSmallEn)]
+    pub local_model: LocalModelKind,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalModelKind {
+    AllMinilm,
+    BgeSmallEn,
+    BgeBaseEn,
+}
+
+impl LocalModelKind {
+    pub fn into_local(self) -> LocalModel {
+        match self {
+            LocalModelKind::AllMinilm => LocalModel::AllMiniLM,
+            LocalModelKind::BgeSmallEn => LocalModel::BgeSmallEn,
+            LocalModelKind::BgeBaseEn => LocalModel::BgeBaseEn,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +72,8 @@ pub enum EmbedderKind {
     /// OpenAI text embeddings (`text-embedding-3-small` by default).
     /// Requires `OPENAI_API_KEY` in the environment.
     Openai,
+    /// Local sentence-transformer model via fastembed (downloads on first run).
+    Local,
 }
 
 #[derive(Deserialize, Debug)]
@@ -62,6 +90,9 @@ struct Manifest {
     dim: usize,
     use_bigrams: bool,
     openai_model: Option<String>,
+    local_model: Option<LocalModelKind>,
+    projection_seed: Option<u64>,
+    source_dim: Option<usize>,
     n_entries: usize,
     ids: Vec<String>,
     scope: BTreeMap<String, Vec<usize>>,
@@ -85,6 +116,7 @@ pub fn run(args: IndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     let signatures = match args.embedder {
         EmbedderKind::Hashed => embed_hashed(args.dim, !args.no_bigrams, &texts)?,
         EmbedderKind::Openai => embed_openai(args.dim, args.openai_model.as_deref(), &texts)?,
+        EmbedderKind::Local => embed_local(args.local_model, &texts)?,
     };
     let elapsed = started.elapsed();
 
@@ -109,11 +141,23 @@ pub fn run(args: IndexArgs) -> Result<(), Box<dyn std::error::Error>> {
     let sigs_path = args.out.join("signatures.bin");
     SignatureIndex::new(signatures).write_to_file(&sigs_path)?;
 
+    let (local_model, projection_seed, source_dim) = match args.embedder {
+        EmbedderKind::Local => (
+            Some(args.local_model),
+            Some(LOCAL_PROJECTION_SEED),
+            Some(args.local_model.into_local().dim()),
+        ),
+        _ => (None, None, None),
+    };
+
     let manifest = Manifest {
         embedder: args.embedder,
         dim: args.dim,
         use_bigrams: !args.no_bigrams,
         openai_model: args.openai_model,
+        local_model,
+        projection_seed,
+        source_dim,
         n_entries: entries.len(),
         ids: entries.iter().map(|e| e.id.clone()).collect(),
         scope,
@@ -172,8 +216,21 @@ fn embed_openai(
         e = e.with_model(m);
     }
     let pipe = EmbeddingPipeline::new_direct(e)?;
-    // The OpenAI API accepts up to 2048 inputs per request; chunk to be safe.
     const BATCH: usize = 256;
+    let mut out: Vec<BinarySignature> = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(BATCH) {
+        let part = pipe.embed_batch_to_signatures(chunk)?;
+        out.extend(part);
+    }
+    Ok(out)
+}
+
+fn embed_local(kind: LocalModelKind, texts: &[&str]) -> Result<Vec<BinarySignature>, PrimdError> {
+    let local = LocalEmbedder::new(kind.into_local())?;
+    let proj = random_projection(LOCAL_PROJECTION_SEED, kind.into_local().dim());
+    let pipe = EmbeddingPipeline::new_with_pca(local, proj)?;
+    // fastembed handles its own internal batching but chunking guards memory.
+    const BATCH: usize = 64;
     let mut out: Vec<BinarySignature> = Vec::with_capacity(texts.len());
     for chunk in texts.chunks(BATCH) {
         let part = pipe.embed_batch_to_signatures(chunk)?;

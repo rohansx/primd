@@ -13,6 +13,7 @@ memmap2.workspace = true
 ureq = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+fastembed = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
@@ -20,3 +21,4 @@ rand.workspace = true
 [features]
 default = []
 openai = ["dep:ureq", "dep:serde", "dep:serde_json"]
+local = ["dep:fastembed"]

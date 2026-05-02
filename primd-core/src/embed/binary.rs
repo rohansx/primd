@@ -127,6 +127,31 @@ impl PcaProjector {
     }
 }
 
+/// Build a deterministic random projection from `source_dim` to 256 dimensions.
+///
+/// Uses Achlioptas-style sparse signs (±1/√source_dim) seeded by `seed`. The
+/// resulting `PcaProjector` approximately preserves L2 distances and inner
+/// products by the Johnson-Lindenstrauss lemma. Save just the seed alongside
+/// the index — query-time reconstruction is exact.
+pub fn random_projection(seed: u64, source_dim: usize) -> PcaProjector {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let scale = 1.0 / (source_dim as f32).sqrt();
+    let mut matrix = vec![0.0f32; 256 * source_dim];
+    for i in 0..256 {
+        for j in 0..source_dim {
+            let mut h = DefaultHasher::new();
+            seed.hash(&mut h);
+            i.hash(&mut h);
+            j.hash(&mut h);
+            let bit = (h.finish() & 1) == 0;
+            matrix[i * source_dim + j] = if bit { scale } else { -scale };
+        }
+    }
+    PcaProjector::new(matrix, source_dim).expect("matrix dim is correct by construction")
+}
+
 /// Sign-bit quantization: for each of 256 components, bit = 1 if value >= 0.
 pub fn sign_bit_quantize(projected: &[f32; 256]) -> BinarySignature {
     let mut sig = [0u8; 32];

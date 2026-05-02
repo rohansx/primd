@@ -1,5 +1,6 @@
 mod cmd_index;
 mod cmd_query;
+mod cmd_serve;
 
 use clap::{Parser, Subcommand};
 
@@ -21,6 +22,9 @@ enum Command {
 
     /// Query an existing index from text.
     Query(cmd_query::QueryArgs),
+
+    /// Serve an index over HTTP for use as a retrieval microservice.
+    Serve(cmd_serve::ServeArgs),
 }
 
 fn main() {
@@ -28,6 +32,7 @@ fn main() {
     let result = match cli.command {
         Command::Index(args) => cmd_index::run(args),
         Command::Query(args) => cmd_query::run(args),
+        Command::Serve(args) => cmd_serve::run(args),
     };
 
     if let Err(e) = result {

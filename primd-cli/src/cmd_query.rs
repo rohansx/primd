@@ -6,11 +6,13 @@ use std::time::Instant;
 use clap::Args;
 use serde::Deserialize;
 
-use primd_core::embed::{EmbeddingPipeline, HashedEmbedder, OpenAIEmbedder};
+use primd_core::embed::{
+    EmbeddingPipeline, HashedEmbedder, LocalEmbedder, OpenAIEmbedder, random_projection,
+};
 use primd_core::index::signatures::SignatureIndex;
 use primd_core::{BinarySignature, PrimdError};
 
-use crate::cmd_index::EmbedderKind;
+use crate::cmd_index::{EmbedderKind, LocalModelKind};
 
 #[derive(Args, Debug)]
 pub struct QueryArgs {
@@ -38,6 +40,12 @@ struct Manifest {
     use_bigrams: bool,
     #[serde(default)]
     openai_model: Option<String>,
+    #[serde(default)]
+    local_model: Option<LocalModelKind>,
+    #[serde(default)]
+    projection_seed: Option<u64>,
+    #[serde(default)]
+    source_dim: Option<usize>,
     n_entries: usize,
     ids: Vec<String>,
     #[serde(default)]
@@ -130,6 +138,21 @@ fn embed_query(manifest: &Manifest, text: &str) -> Result<BinarySignature, Primd
                 e = e.with_model(m);
             }
             let pipe = EmbeddingPipeline::new_direct(e)?;
+            pipe.embed_to_signature(text)
+        }
+        EmbedderKind::Local => {
+            let kind = manifest
+                .local_model
+                .ok_or_else(|| PrimdError::Embedder("manifest missing local_model".into()))?;
+            let seed = manifest
+                .projection_seed
+                .ok_or_else(|| PrimdError::Embedder("manifest missing projection_seed".into()))?;
+            let source_dim = manifest
+                .source_dim
+                .ok_or_else(|| PrimdError::Embedder("manifest missing source_dim".into()))?;
+            let local = LocalEmbedder::new(kind.into_local())?;
+            let proj = random_projection(seed, source_dim);
+            let pipe = EmbeddingPipeline::new_with_pca(local, proj)?;
             pipe.embed_to_signature(text)
         }
     }

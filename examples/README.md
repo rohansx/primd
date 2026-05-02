@@ -22,7 +22,7 @@ cargo build --release -p primd-cli
 
 ## Production retrieval (OpenAI embeddings)
 
-For real semantic recall, swap the embedder. Requires `OPENAI_API_KEY`.
+For real semantic recall via API, swap the embedder. Requires `OPENAI_API_KEY`.
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -38,9 +38,53 @@ export OPENAI_API_KEY=sk-...
 ```
 
 primd asks OpenAI for `text-embedding-3-small` with `dimensions=256`, so the
-returned vector is already 256-dim and skips PCA. The retrieval pipeline
-(SignatureIndex, prefetch, delta cache) is unchanged; only the input
-embedder differs.
+returned vector is direct-quantize ready and skips PCA.
+
+## Production retrieval (fully local)
+
+For real semantic recall *without* network or API keys, use the local
+sentence-transformer backend (BGE-small by default, ~90MB ONNX model
+downloaded once into `~/.cache/fastembed`).
+
+```bash
+./target/release/primd index \
+  --input examples/faq.jsonl \
+  --out /tmp/primd-faq-local \
+  --embedder local --local-model bge-small-en
+
+./target/release/primd query \
+  --index /tmp/primd-faq-local \
+  --text "what does the premium plan cost"
+```
+
+Available `--local-model` values: `all-minilm` (384-dim, fastest),
+`bge-small-en` (384-dim, default, recommended), `bge-base-en` (768-dim, best).
+All three feed through a deterministic 384/768→256 random projection before
+sign-bit quantization, preserving Hamming-distance fidelity by the
+Johnson-Lindenstrauss lemma.
+
+## HTTP service
+
+Once an index exists, expose it as a retrieval microservice:
+
+```bash
+./target/release/primd serve \
+  --index /tmp/primd-faq \
+  --bind 127.0.0.1:8080
+```
+
+```bash
+# In another terminal
+curl -s http://localhost:8080/health
+curl -s -X POST http://localhost:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"is there a free trial","top_k":3}'
+curl -s http://localhost:8080/stats
+```
+
+This is the integration point for Pipecat / LiveKit / Vocode plugins — any
+voice-agent framework that can POST to a URL can use primd as its retrieval
+layer without linking the Rust crate.
 
 ## What's wired up
 

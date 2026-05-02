@@ -10,7 +10,8 @@ name = "primd"
 path = "src/main.rs"
 
 [dependencies]
-primd-core = { path = "../primd-core", features = ["openai"] }
+primd-core = { path = "../primd-core", features = ["openai", "local"] }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tiny_http.workspace = true
