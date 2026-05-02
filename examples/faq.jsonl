@@ -1,0 +1,30 @@
+{"id":"faq-001","event":"pricing","text":"Our basic plan costs nine dollars per month with all core features included."}
+{"id":"faq-002","event":"pricing","text":"The premium plan is twenty-nine dollars per month and adds advanced analytics."}
+{"id":"faq-003","event":"pricing","text":"Annual billing saves you twenty percent compared to month to month payments."}
+{"id":"faq-004","event":"pricing","text":"Enterprise pricing is custom; please contact sales for a quote tailored to your team size."}
+{"id":"faq-005","event":"pricing","text":"There is no charge for unused seats; you only pay for active users each month."}
+{"id":"faq-006","event":"trial","text":"You can start a free fourteen day trial without entering a credit card."}
+{"id":"faq-007","event":"trial","text":"After your trial ends you keep access to your data for thirty days before deletion."}
+{"id":"faq-008","event":"trial","text":"During the trial you have access to every feature on the premium plan with no limits."}
+{"id":"faq-009","event":"refund","text":"We offer a full refund within thirty days of purchase, no questions asked."}
+{"id":"faq-010","event":"refund","text":"To request a refund, email support and include your order number."}
+{"id":"faq-011","event":"account","text":"You can change your password from the security section of your profile settings."}
+{"id":"faq-012","event":"account","text":"To delete your account, go to settings and choose close account at the bottom of the page."}
+{"id":"faq-013","event":"account","text":"You can invite teammates by sharing the workspace invite link from team settings."}
+{"id":"faq-014","event":"account","text":"Multi factor authentication is available and recommended for all accounts."}
+{"id":"faq-015","event":"feature","text":"We support exporting your data to CSV, JSON, and Parquet at any time."}
+{"id":"faq-016","event":"feature","text":"Our API has a generous rate limit of one thousand requests per minute on the premium plan."}
+{"id":"faq-017","event":"feature","text":"Webhooks let you trigger external systems when records change in your workspace."}
+{"id":"faq-018","event":"feature","text":"Single sign on through Google, Okta, and Microsoft is available on enterprise plans."}
+{"id":"faq-019","event":"feature","text":"You can integrate with Slack to receive notifications about important workspace events."}
+{"id":"faq-020","event":"support","text":"Our support team replies within one business day for all paid plans."}
+{"id":"faq-021","event":"support","text":"Live chat is available during business hours for premium and enterprise customers."}
+{"id":"faq-022","event":"support","text":"You can find our extensive documentation and tutorials at our help center."}
+{"id":"faq-023","event":"support","text":"For urgent issues, enterprise customers have access to a twenty four seven phone support line."}
+{"id":"faq-024","event":"security","text":"All data is encrypted at rest with AES two hundred fifty six and in transit with TLS one point three."}
+{"id":"faq-025","event":"security","text":"We are SOC two type two certified and complete an annual third party audit."}
+{"id":"faq-026","event":"security","text":"You can enable session timeouts and IP allow listing on enterprise plans."}
+{"id":"faq-027","event":"security","text":"Customer data is never used to train any machine learning models."}
+{"id":"faq-028","event":"data","text":"Backups run every six hours and are retained for thirty days."}
+{"id":"faq-029","event":"data","text":"Data residency in the European Union, United States, and Asia Pacific is available."}
+{"id":"faq-030","event":"data","text":"You retain ownership of all data uploaded to your workspace at all times."}

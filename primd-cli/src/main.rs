@@ -1,13 +1,37 @@
+mod cmd_index;
+mod cmd_query;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "primd",
+    version,
+    about = "Sub-millisecond predictive retrieval runtime for voice AI"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Build a signature index from a JSONL corpus.
+    Index(cmd_index::IndexArgs),
+
+    /// Query an existing index from text.
+    Query(cmd_query::QueryArgs),
+}
+
 fn main() {
-    let version = env!("CARGO_PKG_VERSION");
-    println!("primd v{version}");
-    println!();
-    println!("sub-millisecond predictive retrieval for voice AI");
-    println!();
-    println!("commands (coming soon):");
-    println!("  primd index   — index a corpus");
-    println!("  primd train   — train transition matrix");
-    println!("  primd serve   — serve as HTTP endpoint");
-    println!("  primd bench   — run benchmarks");
-    println!("  primd check   — check index quality");
+    let cli = Cli::parse();
+    let result = match cli.command {
+        Command::Index(args) => cmd_index::run(args),
+        Command::Query(args) => cmd_query::run(args),
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
 }

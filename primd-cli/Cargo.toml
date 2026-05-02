@@ -11,3 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 primd-core = { path = "../primd-core" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -128,7 +128,7 @@ impl PcaProjector {
 }
 
 /// Sign-bit quantization: for each of 256 components, bit = 1 if value >= 0.
-fn sign_bit_quantize(projected: &[f32; 256]) -> BinarySignature {
+pub fn sign_bit_quantize(projected: &[f32; 256]) -> BinarySignature {
     let mut sig = [0u8; 32];
     for (i, &val) in projected.iter().enumerate() {
         if val >= 0.0 {
