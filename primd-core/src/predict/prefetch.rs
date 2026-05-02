@@ -4,6 +4,7 @@ use std::time::Instant;
 use crate::embed::binary::BinarySignature;
 use crate::index::signatures::SignatureIndex;
 
+use super::cache::{DeltaCache, DeltaCacheStats};
 use super::markov::MarkovPredictor;
 use super::state::{ConversationState, EventId};
 use super::streaming::{EmitDecision, StreamingQuery};
@@ -182,17 +183,33 @@ pub struct StreamingPrefetchStats {
     pub partial_updates: u64,
     pub speculative_scans: u64,
     pub finals_served_speculatively: u64,
+    pub finals_served_from_cache: u64,
     pub finals_required_rescan: u64,
     pub total_speculative_scan_ns: u128,
+    pub delta_cache_hits: u64,
 }
 
 impl StreamingPrefetchStats {
     pub fn speculative_hit_rate(&self) -> f32 {
-        let total = self.finals_served_speculatively + self.finals_required_rescan;
+        let total = self.finals_served_speculatively
+            + self.finals_served_from_cache
+            + self.finals_required_rescan;
         if total == 0 {
             return 0.0;
         }
         self.finals_served_speculatively as f32 / total as f32
+    }
+
+    /// Fraction of finalized utterances served entirely from cache (either
+    /// the in-utterance speculative slot or the cross-utterance delta cache).
+    pub fn served_without_rescan_rate(&self) -> f32 {
+        let total = self.finals_served_speculatively
+            + self.finals_served_from_cache
+            + self.finals_required_rescan;
+        if total == 0 {
+            return 0.0;
+        }
+        (self.finals_served_speculatively + self.finals_served_from_cache) as f32 / total as f32
     }
 }
 
@@ -213,6 +230,8 @@ pub struct StreamingPrefetcher<'a> {
     cached_results: Option<Vec<(u32, usize)>>,
     cached_for_sig: Option<BinarySignature>,
     last_top_k: usize,
+    delta_cache: Option<DeltaCache>,
+    last_scope_hash: u64,
     stats: StreamingPrefetchStats,
 }
 
@@ -224,68 +243,109 @@ impl<'a> StreamingPrefetcher<'a> {
             cached_results: None,
             cached_for_sig: None,
             last_top_k: 10,
+            delta_cache: None,
+            last_scope_hash: 0,
             stats: StreamingPrefetchStats::default(),
         }
+    }
+
+    /// Enable the predictive coding delta cache. `tolerance` is the max
+    /// Hamming distance for two queries to share a cached result;
+    /// `max_per_scope` caps cached entries per predicted-scope bucket.
+    pub fn with_delta_cache(mut self, tolerance: u32, max_per_scope: usize) -> Self {
+        self.delta_cache = Some(DeltaCache::new(tolerance, max_per_scope));
+        self
     }
 
     /// Refresh the predicted scope. Call this whenever the conversation state
     /// changes (typically once per finalized turn).
     pub fn prefetch(&mut self, state: &ConversationState) {
         self.coord.prefetch(state);
+        self.last_scope_hash = DeltaCache::scope_hash(self.coord.last_predicted_events());
     }
 
-    /// New STT partial. If the gate emits, runs a speculative warm scan and
-    /// caches the result. The caller does not block on this — in production
-    /// it would run on a worker thread.
+    /// New STT partial. If the gate emits, either return a cached top-K from
+    /// the delta cache or run a speculative warm scan and populate the cache.
     pub fn on_partial(&mut self, partial: BinarySignature, k: usize) {
         self.stats.partial_updates += 1;
         self.last_top_k = k;
-        if let EmitDecision::Emitted(sig) = self.gate.update(partial) {
-            let scope = self.coord.last_predicted_scope();
-            let started = Instant::now();
-            let results = self.coord.index().scan_top_k_subset(&sig, scope, k);
-            let elapsed = started.elapsed().as_nanos();
+        let EmitDecision::Emitted(sig) = self.gate.update(partial) else {
+            return;
+        };
 
-            self.cached_results = Some(results);
+        // Delta cache lookup
+        if let Some(cache) = &mut self.delta_cache
+            && let Some(cached) = cache.lookup(self.last_scope_hash, &sig, k)
+        {
+            self.cached_results = Some(cached);
             self.cached_for_sig = Some(sig);
-            self.stats.speculative_scans += 1;
-            self.stats.total_speculative_scan_ns += elapsed;
+            self.stats.delta_cache_hits += 1;
+            return;
         }
+
+        let scope = self.coord.last_predicted_scope();
+        let started = Instant::now();
+        let results = self.coord.index().scan_top_k_subset(&sig, scope, k);
+        let elapsed = started.elapsed().as_nanos();
+
+        if let Some(cache) = &mut self.delta_cache {
+            cache.insert(self.last_scope_hash, sig, k, results.clone());
+        }
+
+        self.cached_results = Some(results);
+        self.cached_for_sig = Some(sig);
+        self.stats.speculative_scans += 1;
+        self.stats.total_speculative_scan_ns += elapsed;
     }
 
-    /// STT finalized. If the final signature is close enough to the last
-    /// speculative emit, the cached top-K is returned for free; otherwise a
-    /// fresh warm scan runs against the final signature.
-    ///
-    /// `accept_drift` is the maximum Hamming distance between the final and
-    /// the speculative signature for the cache to be considered fresh.
+    /// STT finalized. Lookup order:
+    /// 1. The local speculative cache (last `on_partial` result).
+    /// 2. The persistent delta cache (across utterances).
+    /// 3. Fresh warm scan against the predicted scope.
     pub fn on_final(
         &mut self,
         final_sig: BinarySignature,
         k: usize,
         accept_drift: u32,
     ) -> FinalScanResult {
-        let cache_fresh = match (self.cached_for_sig, &self.cached_results) {
-            (Some(spec), Some(cached)) => {
-                spec.hamming_distance(&final_sig) <= accept_drift && cached.len() == k
-            }
-            _ => false,
-        };
-
-        if cache_fresh {
+        // 1. Speculative serve from this utterance's last partial.
+        let speculative_fresh = matches!(
+            (self.cached_for_sig, &self.cached_results),
+            (Some(spec), Some(cached))
+                if spec.hamming_distance(&final_sig) <= accept_drift && cached.len() == k
+        );
+        if speculative_fresh {
             self.stats.finals_served_speculatively += 1;
-            FinalScanResult {
+            return FinalScanResult {
                 results: self.cached_results.clone().unwrap_or_default(),
                 served_speculatively: true,
-            }
-        } else {
-            self.stats.finals_required_rescan += 1;
-            let scope = self.coord.last_predicted_scope();
-            let results = self.coord.index().scan_top_k_subset(&final_sig, scope, k);
-            FinalScanResult {
-                results,
+                delta_cache_hit: false,
+            };
+        }
+
+        // 2. Cross-utterance delta cache hit.
+        if let Some(cache) = &mut self.delta_cache
+            && let Some(cached) = cache.lookup(self.last_scope_hash, &final_sig, k)
+        {
+            self.stats.finals_served_from_cache += 1;
+            return FinalScanResult {
+                results: cached,
                 served_speculatively: false,
-            }
+                delta_cache_hit: true,
+            };
+        }
+
+        // 3. Fresh warm scan.
+        self.stats.finals_required_rescan += 1;
+        let scope = self.coord.last_predicted_scope();
+        let results = self.coord.index().scan_top_k_subset(&final_sig, scope, k);
+        if let Some(cache) = &mut self.delta_cache {
+            cache.insert(self.last_scope_hash, final_sig, k, results.clone());
+        }
+        FinalScanResult {
+            results,
+            served_speculatively: false,
+            delta_cache_hit: false,
         }
     }
 
@@ -301,6 +361,10 @@ impl<'a> StreamingPrefetcher<'a> {
         self.stats
     }
 
+    pub fn delta_cache_stats(&self) -> Option<DeltaCacheStats> {
+        self.delta_cache.as_ref().map(|c| c.stats())
+    }
+
     pub fn coordinator(&self) -> &PrefetchCoordinator<'a> {
         &self.coord
     }
@@ -314,6 +378,7 @@ impl<'a> StreamingPrefetcher<'a> {
 pub struct FinalScanResult {
     pub results: Vec<(u32, usize)>,
     pub served_speculatively: bool,
+    pub delta_cache_hit: bool,
 }
 
 #[cfg(test)]
@@ -479,5 +544,60 @@ mod tests {
         // Only the first partial should have triggered a speculative scan.
         assert_eq!(sp.stats().speculative_scans, 1);
         assert_eq!(sp.stats().partial_updates, 5);
+    }
+
+    #[test]
+    fn delta_cache_serves_repeated_query_across_utterances() {
+        let (idx, scope) = build_test_index();
+        let mut predictor = MarkovPredictor::with_smoothing(0.01);
+        for _ in 0..20 {
+            predictor.observe_sequence(&[ev(1), ev(2)]);
+        }
+        let coord = PrefetchCoordinator::new(&idx, predictor, scope).with_confidence_threshold(0.1);
+        let mut sp = StreamingPrefetcher::new(coord, 16).with_delta_cache(16, 32);
+
+        let mut state = ConversationState::new(5, std::time::Duration::from_secs(60));
+        state.observe(ev(1));
+
+        // First utterance: scan, populate cache.
+        sp.prefetch(&state);
+        let q = make_sig(0x20);
+        let _ = sp.on_final(q, 5, 16);
+        sp.end_utterance();
+
+        // Second utterance, same scope, same final: should hit delta cache.
+        sp.prefetch(&state);
+        let result = sp.on_final(q, 5, 16);
+        assert!(result.delta_cache_hit);
+        assert_eq!(sp.stats().finals_served_from_cache, 1);
+        assert_eq!(sp.stats().finals_required_rescan, 1);
+    }
+
+    #[test]
+    fn delta_cache_isolates_by_scope() {
+        let (idx, scope) = build_test_index();
+        let mut predictor = MarkovPredictor::with_smoothing(0.01);
+        // Train both ev(1)→ev(2) and ev(3)→ev(4) so two different scopes form.
+        for _ in 0..20 {
+            predictor.observe_sequence(&[ev(1), ev(2)]);
+            predictor.observe_sequence(&[ev(3), ev(4)]);
+        }
+        let coord = PrefetchCoordinator::new(&idx, predictor, scope).with_confidence_threshold(0.1);
+        let mut sp = StreamingPrefetcher::new(coord, 16).with_delta_cache(16, 32);
+
+        let mut s1 = ConversationState::new(5, std::time::Duration::from_secs(60));
+        s1.observe(ev(1));
+        let mut s3 = ConversationState::new(5, std::time::Duration::from_secs(60));
+        s3.observe(ev(3));
+        let q = make_sig(0x20);
+
+        sp.prefetch(&s1);
+        let _ = sp.on_final(q, 5, 16);
+        sp.end_utterance();
+
+        // Different scope, same query — must miss cache.
+        sp.prefetch(&s3);
+        let result = sp.on_final(q, 5, 16);
+        assert!(!result.delta_cache_hit);
     }
 }

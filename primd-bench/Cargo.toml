@@ -24,3 +24,7 @@ harness = false
 [[bench]]
 name = "streaming"
 harness = false
+
+[[bench]]
+name = "full_pipeline"
+harness = false

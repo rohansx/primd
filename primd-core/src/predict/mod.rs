@@ -1,8 +1,10 @@
+pub mod cache;
 pub mod markov;
 pub mod prefetch;
 pub mod state;
 pub mod streaming;
 
+pub use cache::{DeltaCache, DeltaCacheStats};
 pub use markov::{MarkovPredictor, Prediction};
 pub use prefetch::{
     FinalScanResult, PrefetchCoordinator, PrefetchStats, StreamingPrefetchStats,
