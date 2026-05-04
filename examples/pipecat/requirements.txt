@@ -1,7 +1,7 @@
 # CLI demo only needs httpx
 httpx>=0.27
 
-# Pipecat voice agent. The exact extras depend on your provider stack.
+# Pipecat voice agent. This example uses Sarvam for STT/TTS/LLM.
 # Pin to a known-working version range; Pipecat changes frame APIs
 # every few releases.
-pipecat-ai[daily,deepgram,openai,cartesia,silero]>=0.0.49
+pipecat-ai[daily,sarvam,silero]>=0.0.49

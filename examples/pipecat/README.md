@@ -5,9 +5,9 @@ Three pieces here, each runnable in isolation:
 | File | What it is | Runtime deps |
 |---|---|---|
 | `primd_client.py` | Async Python client for `primd serve` | `httpx` |
-| `cli_demo.py` | Standalone REPL: text → primd → top-K (+ optional LLM) | `httpx` |
+| `cli_demo.py` | Standalone REPL: text → primd → top-K (+ optional Sarvam/OpenAI LLM) | `httpx` |
 | `primd_retriever.py` | Pipecat `FrameProcessor` that injects primd hits into the LLM context | `pipecat-ai` |
-| `voice_agent.py` | Reference end-to-end voice agent (Daily + Deepgram + OpenAI + Cartesia + primd) | full Pipecat stack |
+| `voice_agent.py` | Reference end-to-end voice agent (Daily + Sarvam STT/LLM/TTS + primd) | full Pipecat stack |
 
 ## Step 1 — start primd
 
@@ -46,23 +46,28 @@ primd: embedder=hashed embed=27us scan=230us network=2546us corpus=30
   ...
 ```
 
-For an LLM-drafted answer:
+For an LLM-drafted answer with Sarvam:
+
+```bash
+export SARVAM_API_KEY=sk-...
+python examples/pipecat/cli_demo.py --llm --llm-provider sarvam
+```
+
+Or with OpenAI:
 
 ```bash
 export OPENAI_API_KEY=sk-...
-python examples/pipecat/cli_demo.py --llm
+python examples/pipecat/cli_demo.py --llm --llm-provider openai
 ```
 
-The REPL hands every question to primd first, then asks GPT-4o-mini to
+The REPL hands every question to primd first, then asks the selected LLM to
 answer using only the retrieved hits.
 
 ## Step 3 — run the voice agent (Pipecat)
 
 ```bash
 pip install -r examples/pipecat/requirements.txt
-export DEEPGRAM_API_KEY=...
-export OPENAI_API_KEY=...
-export CARTESIA_API_KEY=...
+export SARVAM_API_KEY=...
 export DAILY_API_KEY=...
 python examples/pipecat/voice_agent.py \
   --room https://yourdomain.daily.co/your-room
@@ -72,7 +77,7 @@ Then open the Daily room in any browser and talk to the agent. The pipeline
 is:
 
 ```
-mic → Deepgram → PrimdRetriever → OpenAI → Cartesia → speaker
+mic → Sarvam STT → PrimdRetriever → Sarvam LLM → Sarvam TTS → speaker
                        │
                        └─► POST :8080/query → top-K → LLM context
 ```
@@ -109,11 +114,27 @@ posts to primd and pushes a fresh `LLMMessagesAppendFrame` so the LLM sees
 the retrieved context on the next turn. The original transcription frame
 is forwarded unchanged.
 
-## Swapping the embedder
+## Swapping the primd embedder
 
 Nothing in the Pipecat layer cares which embedder primd is using. Reindex
 with `--embedder local` (BGE-small) or `--embedder openai` and restart
-`primd serve`; the Python side does not change.
+`primd serve`; the Python side does not change. Sarvam does not currently
+publish a public embeddings endpoint, so retrieval indexing still uses primd's
+existing `hashed`, `local`, or `openai` backends.
+
+## Session HTTP API
+
+`primd serve` now exposes conversation-aware endpoints in addition to `POST /query`:
+
+```bash
+POST /session/{id}/observe
+POST /session/{id}/finalize
+POST /session/{id}/warm
+POST /session/{id}/reset
+```
+
+That lets a voice framework keep predictor and speculative-retrieval state on
+the Rust side instead of treating primd as a fully stateless retriever.
 
 ## What's not wired up yet
 
@@ -122,8 +143,7 @@ with `--embedder local` (BGE-small) or `--embedder openai` and restart
   frames. Hooking partials into primd's streaming layer (layer 1) would
   let the speculative scan happen *during* user speech instead of after.
   That is the next obvious win.
-- **Conversation state for the predictor.** primd's Markov predictor
-  (layer 3) is unused over HTTP — the serve endpoint is a single-shot
-  retrieval API. Exposing per-session conversation state would unlock
-  the predictor's prefetch path. Plausible API:
-  `POST /session/{id}/observe` + `POST /session/{id}/query`.
+- **Pipecat session plumbing.** The example retriever still calls the simple
+  `POST /query` path. Switching it to `POST /session/{id}/observe` and
+  `POST /session/{id}/finalize` is the next integration step if you want the
+  voice pipeline to use speculative retrieval and predictor state over HTTP.

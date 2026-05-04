@@ -44,6 +44,9 @@ primd-bench/corpora/
 *.profraw
 *.profdata
 
+# Tooling caches
+.reflect/
+
 # Index data (user-generated)
 *.hnsw
 *.bin

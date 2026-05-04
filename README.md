@@ -39,28 +39,52 @@ For context, a blink takes ~100ms. primd targets retrieval 100-1000x faster than
 ## What You Get
 
 - A **single Rust binary** (~8-12 MB)
-- **Drop-in plugins** for Pipecat and LiveKit
-- **Python and TypeScript SDKs**
-- **WASM build** for in-browser deployment
+- A **CLI** for indexing, querying, serving, and training predictors
+- A **session-aware HTTP API** for partials, finalize, and warm-next flows
+- A **Pipecat example** wired to `primd serve`
 - **Apache-2.0 licensed**
 
 ## Quick Example
 
-```python
-from primd import Index, QueryContext
+```bash
+cargo build --release -p primd-cli
 
-idx = Index.open("/var/lib/primd/corpus")
-ctx = idx.session()
+./target/release/primd index \
+  --input examples/faq.jsonl \
+  --out /tmp/primd-faq \
+  --embedder hashed
 
-# Feed partial transcripts as they arrive from STT
-async for partial in stt_stream:
-    ctx.observe(partial)
+./target/release/primd train \
+  --corpus /tmp/primd-faq \
+  --transcripts examples/transcripts.jsonl
 
-# By end-of-utterance, results are already waiting
-results = await ctx.finalize()
+./target/release/primd serve \
+  --index /tmp/primd-faq \
+  --bind 127.0.0.1:8080
+```
 
-# While TTS plays the response, prefetch next likely answers
-await ctx.warm_next()
+Stateless query:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/query \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"is there a free trial","top_k":3}'
+```
+
+Session query flow:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/session/demo/observe \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"what about pri","top_k":3}'
+
+curl -s -X POST http://127.0.0.1:8080/session/demo/finalize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"what about pricing","top_k":3}'
+
+curl -s -X POST http://127.0.0.1:8080/session/demo/warm \
+  -H 'Content-Type: application/json' \
+  -d '{}'
 ```
 
 ## What It's For
@@ -86,7 +110,21 @@ await ctx.warm_next()
 
 ## Status
 
-Pre-build. MVP targeting 12 weeks to public benchmark.
+Alpha. The repo now includes:
+
+- SIMD binary signature search
+- event-scoped hierarchical rerank over shard scopes
+- `QueryContext` session runtime in `primd-core`
+- session-aware HTTP endpoints
+- Markov predictor training and persistence
+- Pipecat + Sarvam example integration
+
+Still planned:
+
+- true per-event HNSW shards instead of shard-local subset rescans
+- packaged Python/TypeScript SDKs
+- LiveKit plugin
+- WASM/browser target
 
 ## License
 

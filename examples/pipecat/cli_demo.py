@@ -14,8 +14,11 @@ Usage:
     # No LLM, just see what primd returns:
     python cli_demo.py
 
+    # With Sarvam for the final answer:
+    SARVAM_API_KEY=sk-... python cli_demo.py --llm --llm-provider sarvam
+
     # With OpenAI for the final answer:
-    OPENAI_API_KEY=sk-... python cli_demo.py --llm
+    OPENAI_API_KEY=sk-... python cli_demo.py --llm --llm-provider openai
 
     # Single-shot:
     python cli_demo.py --text "is there a free trial"
@@ -68,11 +71,26 @@ async def _draft_answer(
     question: str,
     qr: QueryResult,
     faq_lookup: dict[str, str],
+    provider: str,
 ) -> Optional[str]:
-    """Call OpenAI with the retrieved hits as context."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return None
+    """Call the selected LLM provider with the retrieved hits as context."""
+    if provider == "sarvam":
+        api_key = os.environ.get("SARVAM_API_KEY")
+        if not api_key:
+            return None
+        url = "https://api.sarvam.ai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "api-subscription-key": api_key,
+        }
+        model = "sarvam-30b"
+    else:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            return None
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        model = "gpt-4o-mini"
 
     context_lines = []
     for h in qr.hits:
@@ -82,7 +100,7 @@ async def _draft_answer(
     context = "\n".join(context_lines)
 
     body = {
-        "model": "gpt-4o-mini",
+        "model": model,
         "messages": [
             {
                 "role": "system",
@@ -100,9 +118,9 @@ async def _draft_answer(
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            "https://api.openai.com/v1/chat/completions",
+            url,
             json=body,
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
         )
         r.raise_for_status()
         data = r.json()
@@ -114,6 +132,7 @@ async def _ask_one(
     client: PrimdClient,
     faq_lookup: dict[str, str],
     use_llm: bool,
+    llm_provider: str,
     top_k: int,
 ) -> None:
     print(f"\nyou: {question}")
@@ -128,12 +147,13 @@ async def _ask_one(
 
     if use_llm:
         llm_start = time.perf_counter()
-        answer = await _draft_answer(question, qr, faq_lookup)
+        answer = await _draft_answer(question, qr, faq_lookup, llm_provider)
         llm_us = int((time.perf_counter() - llm_start) * 1_000_000)
         if answer is None:
-            print("llm: (skipped — set OPENAI_API_KEY to enable)")
+            env_var = "SARVAM_API_KEY" if llm_provider == "sarvam" else "OPENAI_API_KEY"
+            print(f"llm: (skipped — set {env_var} to enable {llm_provider})")
         else:
-            print(f"llm: {answer}  [took {llm_us / 1000:.0f}ms]")
+            print(f"llm[{llm_provider}]: {answer}  [took {llm_us / 1000:.0f}ms]")
 
 
 async def main() -> None:
@@ -146,7 +166,13 @@ async def main() -> None:
         help="JSONL used to index, for showing matched text",
     )
     parser.add_argument("--top", type=int, default=3, help="results per query")
-    parser.add_argument("--llm", action="store_true", help="also call OpenAI to draft an answer")
+    parser.add_argument("--llm", action="store_true", help="also call an LLM to draft an answer")
+    parser.add_argument(
+        "--llm-provider",
+        choices=["sarvam", "openai"],
+        default="sarvam",
+        help="LLM backend for the optional answer draft",
+    )
     parser.add_argument("--text", help="single question; skip the REPL")
     args = parser.parse_args()
 
@@ -159,7 +185,7 @@ async def main() -> None:
             sys.exit(1)
 
         if args.text:
-            await _ask_one(args.text, client, faq_lookup, args.llm, args.top)
+            await _ask_one(args.text, client, faq_lookup, args.llm, args.llm_provider, args.top)
             return
 
         print(f"primd cli demo  |  {args.url}  |  {len(faq_lookup)} corpus entries")
@@ -175,7 +201,7 @@ async def main() -> None:
                 if q.lower() in {"quit", "exit", "q"}:
                     return
                 try:
-                    await _ask_one(q, client, faq_lookup, args.llm, args.top)
+                    await _ask_one(q, client, faq_lookup, args.llm, args.llm_provider, args.top)
                 except httpx.HTTPError as e:
                     print(f"error: {e}")
         except KeyboardInterrupt:

@@ -1,13 +1,12 @@
 """Reference Pipecat voice agent that uses primd as its retrieval layer.
 
 This is a working skeleton — it shows where each piece plugs in but does
-not include credentials. To run it you need accounts/keys for whichever
-STT, LLM, and TTS providers you choose. The cheapest fully-managed combo
-right now is roughly:
+not include credentials. To run it you need accounts/keys for the services
+below. The simplest single-vendor combo for Indian-language voice flows is:
 
-    STT:  Deepgram Nova-3            (~80ms p50 finalisation)
-    LLM:  OpenAI gpt-4o-mini         (~150-300ms TTFT)
-    TTS:  Cartesia Sonic 3           (~40ms first audio chunk)
+    STT:  Sarvam Saaras v3
+    LLM:  Sarvam 30B / 105B
+    TTS:  Sarvam Bulbul v3
     WebRTC: Daily.co or LiveKit
 
 Pipecat handles the framing; primd handles the retrieval; everything else
@@ -16,9 +15,7 @@ touching primd.
 
 Setup:
     pip install -r requirements.txt
-    export DEEPGRAM_API_KEY=...
-    export OPENAI_API_KEY=...
-    export CARTESIA_API_KEY=...
+    export SARVAM_API_KEY=...
     export DAILY_API_KEY=...
     primd serve --index /tmp/primd-faq --bind 127.0.0.1:8080  # in another terminal
     python voice_agent.py --room https://yourdomain.daily.co/your-room
@@ -72,14 +69,14 @@ async def main() -> None:
 
     # Imports are local so the script's --help works even if Pipecat is not
     # installed yet.
-    from pipecat.frames.frames import LLMMessagesFrame
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.runner import PipelineRunner
     from pipecat.pipeline.task import PipelineParams, PipelineTask
-    from pipecat.processors.aggregators.openai_llm_context import OpenAILLMContext
-    from pipecat.services.cartesia.tts import CartesiaTTSService
-    from pipecat.services.deepgram.stt import DeepgramSTTService
-    from pipecat.services.openai.llm import OpenAILLMService
+    from pipecat.processors.aggregators.llm_context import LLMContext
+    from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+    from pipecat.services.sarvam.llm import SarvamLLMService
+    from pipecat.services.sarvam.stt import SarvamSTTService
+    from pipecat.services.sarvam.tts import SarvamTTSService
     from pipecat.transports.services.daily import DailyParams, DailyTransport
 
     corpus = _load_corpus_text(args.corpus)
@@ -92,12 +89,9 @@ async def main() -> None:
         DailyParams(audio_out_enabled=True, vad_enabled=True),
     )
 
-    stt = DeepgramSTTService(api_key=os.environ["DEEPGRAM_API_KEY"])
-    llm = OpenAILLMService(api_key=os.environ["OPENAI_API_KEY"], model="gpt-4o-mini")
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",
-    )
+    stt = SarvamSTTService(api_key=os.environ["SARVAM_API_KEY"], mode="translate")
+    llm = SarvamLLMService(api_key=os.environ["SARVAM_API_KEY"])
+    tts = SarvamTTSService(api_key=os.environ["SARVAM_API_KEY"])
 
     retriever = PrimdRetriever(
         primd_url=args.primd,
@@ -105,19 +99,20 @@ async def main() -> None:
         corpus_text=corpus,
     )
 
-    initial_context = OpenAILLMContext(
+    initial_context = LLMContext(
         messages=[
             {
                 "role": "system",
                 "content": (
                     "You are a friendly customer-support agent on a phone call. "
                     "Speak in short, natural sentences. The user's question will "
-                    "be augmented with retrieved context — answer using only that."
+                    "be augmented with retrieved context. Answer using only that. "
+                    "If the caller speaks an Indian language, respond naturally in English unless told otherwise."
                 ),
             }
         ],
     )
-    context_aggregator = llm.create_context_aggregator(initial_context)
+    context_aggregator = LLMContextAggregatorPair(initial_context)
 
     pipeline = Pipeline(
         [

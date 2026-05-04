@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clap::Args;
@@ -11,23 +11,23 @@ use tiny_http::{Header, Method, Response, Server, StatusCode};
 use primd_core::embed::{
     EmbeddingPipeline, HashedEmbedder, LocalEmbedder, OpenAIEmbedder, random_projection,
 };
-use primd_core::index::signatures::SignatureIndex;
-use primd_core::{BinarySignature, PrimdError};
+use primd_core::{
+    BinarySignature, EventCatalog, HierarchicalIndex, MarkovPredictor, PrimdError, QueryContext,
+    QueryOutput, SearchOptions, ServedBy, SignatureIndex,
+};
 
 use crate::cmd_index::{EmbedderKind, LocalModelKind};
 
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// Index directory built by `primd index`.
     #[arg(short, long)]
     pub index: PathBuf,
 
-    /// Bind address.
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub bind: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Manifest {
     embedder: EmbedderKind,
     dim: usize,
@@ -55,6 +55,9 @@ struct QueryRequest {
     parallel: bool,
 }
 
+#[derive(Deserialize)]
+struct WarmRequest {}
+
 fn default_top_k() -> usize {
     10
 }
@@ -74,6 +77,15 @@ struct QueryResponse {
     scan_us: u128,
     corpus_size: usize,
     hits: Vec<QueryHit>,
+    served_by: &'static str,
+    predicted_events: Vec<String>,
+    shard_scope_size: usize,
+}
+
+#[derive(Serialize)]
+struct SessionWarmResponse {
+    predicted_events: Vec<String>,
+    shard_scope_size: usize,
 }
 
 #[derive(Serialize)]
@@ -85,6 +97,7 @@ struct StatsResponse {
     total_scan_us: u128,
     mean_embed_us: u128,
     mean_scan_us: u128,
+    sessions: usize,
 }
 
 trait QueryEmbedder: Send + Sync {
@@ -99,9 +112,12 @@ impl<E: primd_core::embed::Embedder> QueryEmbedder for EmbeddingPipeline<E> {
 
 struct State {
     manifest: Manifest,
-    index: SignatureIndex,
+    index: HierarchicalIndex,
     event_for: BTreeMap<usize, String>,
+    event_name_for_id: HashMap<u32, String>,
     pipeline: Box<dyn QueryEmbedder>,
+    predictor_path: Option<PathBuf>,
+    sessions: Mutex<HashMap<String, QueryContext>>,
     queries_served: AtomicU64,
     total_embed_ns: AtomicU64,
     total_scan_ns: AtomicU64,
@@ -115,29 +131,44 @@ impl State {
         self.total_scan_ns
             .fetch_add(scan_ns as u64, Ordering::Relaxed);
     }
+
+    fn new_session(&self) -> QueryContext {
+        let predictor = self
+            .predictor_path
+            .as_ref()
+            .and_then(|path| MarkovPredictor::load_from_file(path).ok())
+            .unwrap_or_default();
+        QueryContext::with_predictor(predictor)
+    }
 }
 
 pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let manifest_path = args.index.join("manifest.json");
     let sigs_path = args.index.join("signatures.bin");
+    let transitions_path = args.index.join("transitions.json");
 
     let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
-    let index = SignatureIndex::from_file(&sigs_path)?;
-    if index.len() != manifest.n_entries {
+    let signatures = SignatureIndex::from_file(&sigs_path)?;
+    if signatures.len() != manifest.n_entries {
         return Err(format!(
             "manifest claims {} entries; signatures file has {}",
             manifest.n_entries,
-            index.len()
+            signatures.len()
         )
         .into());
     }
 
-    let mut event_for: BTreeMap<usize, String> = BTreeMap::new();
-    for (event_name, indices) in &manifest.scope {
-        for &i in indices {
-            event_for.insert(i, event_name.clone());
+    let mut event_for = BTreeMap::new();
+    let mut event_name_for_id = HashMap::new();
+    for (i, (event_name, indices)) in manifest.scope.iter().enumerate() {
+        event_name_for_id.insert(i as u32, event_name.clone());
+        for &idx in indices {
+            event_for.insert(idx, event_name.clone());
         }
     }
+
+    let events = EventCatalog::from_named_scope(&manifest.scope, manifest.n_entries);
+    let index = HierarchicalIndex::new(signatures, events);
 
     eprintln!("loading embedder {:?}…", manifest.embedder);
     let pipeline = build_pipeline(&manifest)?;
@@ -146,7 +177,10 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         manifest,
         index,
         event_for,
+        event_name_for_id,
         pipeline,
+        predictor_path: transitions_path.exists().then_some(transitions_path),
+        sessions: Mutex::new(HashMap::new()),
         queries_served: AtomicU64::new(0),
         total_embed_ns: AtomicU64::new(0),
         total_scan_ns: AtomicU64::new(0),
@@ -161,7 +195,9 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         state.index.len(),
         state.manifest.embedder
     );
-    eprintln!("endpoints:  POST /query  GET /health  GET /stats");
+    eprintln!(
+        "endpoints: POST /query | GET /health | GET /stats | POST /session/{{id}}/observe | POST /session/{{id}}/finalize | POST /session/{{id}}/warm | POST /session/{{id}}/reset"
+    );
 
     for mut request in server.incoming_requests() {
         let path = request.url().to_string();
@@ -172,12 +208,10 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             (Method::Get, "/health") => Ok(json_response(200, "{\"status\":\"ok\"}")),
             (Method::Get, "/stats") => stats_response(&state),
             (Method::Post, "/query") => {
-                let mut body = String::new();
-                if let Err(e) = request.as_reader().read_to_string(&mut body) {
-                    Err(format!("read body: {e}"))
-                } else {
-                    handle_query(&state, &body)
-                }
+                read_body(&mut request).and_then(|body| handle_query(&state, &body))
+            }
+            (Method::Post, _) if path.starts_with("/session/") => {
+                read_body(&mut request).and_then(|body| handle_session(&state, &path, &body))
             }
             _ => Ok(json_response(404, "{\"error\":\"not found\"}")),
         };
@@ -186,8 +220,7 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("request error: {e}");
-                let body = format!("{{\"error\":\"{}\"}}", json_escape(&e));
-                json_response(400, body)
+                json_response(400, format!("{{\"error\":\"{}\"}}", json_escape(&e)))
             }
         };
 
@@ -197,6 +230,15 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn read_body(request: &mut tiny_http::Request) -> Result<String, String> {
+    let mut body = String::new();
+    request
+        .as_reader()
+        .read_to_string(&mut body)
+        .map_err(|e| format!("read body: {e}"))?;
+    Ok(body)
 }
 
 fn handle_query(state: &State, body: &str) -> Result<Response<std::io::Cursor<Vec<u8>>>, String> {
@@ -213,17 +255,161 @@ fn handle_query(state: &State, body: &str) -> Result<Response<std::io::Cursor<Ve
     let embed_elapsed = embed_start.elapsed();
 
     let scan_start = Instant::now();
-    let raw = if req.parallel {
-        state.index.scan_top_k_parallel(&query_sig, req.top_k)
-    } else {
-        state.index.scan_top_k(&query_sig, req.top_k)
-    };
+    let search = state.index.search(
+        &query_sig,
+        req.top_k,
+        &SearchOptions {
+            parallel: req.parallel,
+            ..SearchOptions::default()
+        },
+    );
     let scan_elapsed = scan_start.elapsed();
-
     state.record_latency(embed_elapsed.as_nanos(), scan_elapsed.as_nanos());
 
-    let hits: Vec<QueryHit> = raw
-        .into_iter()
+    let response = QueryResponse {
+        embedder: state.manifest.embedder,
+        embed_us: embed_elapsed.as_micros(),
+        scan_us: scan_elapsed.as_micros(),
+        corpus_size: state.index.len(),
+        hits: map_hits(state, search.results),
+        served_by: if search.used_shards {
+            "shard_scan"
+        } else {
+            "full_scan"
+        },
+        predicted_events: search
+            .candidate_events
+            .into_iter()
+            .filter_map(|event| state.event_name_for_id.get(&event.0).cloned())
+            .collect(),
+        shard_scope_size: search.shard_scope_size,
+    };
+    Ok(json_response(
+        200,
+        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
+    ))
+}
+
+fn handle_session(
+    state: &State,
+    path: &str,
+    body: &str,
+) -> Result<Response<std::io::Cursor<Vec<u8>>>, String> {
+    let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if parts.len() != 3 || parts[0] != "session" {
+        return Err("expected /session/{id}/{action}".into());
+    }
+    let session_id = parts[1].to_string();
+    let action = parts[2];
+
+    match action {
+        "observe" => {
+            let req: QueryRequest =
+                serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+            let sig = state
+                .pipeline
+                .embed_query(&req.text)
+                .map_err(|e| e.to_string())?;
+            let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let session = sessions
+                .entry(session_id)
+                .or_insert_with(|| state.new_session());
+            session.observe_partial(&state.index, sig, req.top_k);
+            Ok(json_response(200, "{\"status\":\"ok\"}"))
+        }
+        "finalize" => {
+            let req: QueryRequest =
+                serde_json::from_str(body).map_err(|e| format!("bad json: {e}"))?;
+            let embed_start = Instant::now();
+            let sig = state
+                .pipeline
+                .embed_query(&req.text)
+                .map_err(|e| e.to_string())?;
+            let embed_elapsed = embed_start.elapsed();
+            let scan_start = Instant::now();
+            let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let session = sessions
+                .entry(session_id)
+                .or_insert_with(|| state.new_session());
+            let out = session.finalize(&state.index, sig, req.top_k);
+            let scan_elapsed = scan_start.elapsed();
+            state.record_latency(embed_elapsed.as_nanos(), scan_elapsed.as_nanos());
+            Ok(json_response(
+                200,
+                serde_json::to_string(&session_query_response(
+                    state,
+                    out,
+                    req.top_k,
+                    embed_elapsed.as_micros(),
+                    scan_elapsed.as_micros(),
+                ))
+                .unwrap_or_else(|_| "{}".to_string()),
+            ))
+        }
+        "warm" => {
+            let _: WarmRequest =
+                serde_json::from_str(if body.trim().is_empty() { "{}" } else { body })
+                    .map_err(|e| format!("bad json: {e}"))?;
+            let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
+            let session = sessions
+                .entry(session_id)
+                .or_insert_with(|| state.new_session());
+            let predicted = session.warm_next(&state.index);
+            let response = SessionWarmResponse {
+                predicted_events: predicted
+                    .into_iter()
+                    .filter_map(|event| state.event_name_for_id.get(&event.0).cloned())
+                    .collect(),
+                shard_scope_size: session.predicted_scope_size(),
+            };
+            Ok(json_response(
+                200,
+                serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
+            ))
+        }
+        "reset" => {
+            let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
+            sessions.remove(&session_id);
+            Ok(json_response(200, "{\"status\":\"reset\"}"))
+        }
+        _ => Err("unknown session action".into()),
+    }
+}
+
+fn session_query_response(
+    state: &State,
+    out: QueryOutput,
+    _top_k: usize,
+    embed_us: u128,
+    scan_us: u128,
+) -> QueryResponse {
+    QueryResponse {
+        embedder: state.manifest.embedder,
+        embed_us,
+        scan_us,
+        corpus_size: state.index.len(),
+        hits: map_hits(state, out.results),
+        served_by: served_by_label(out.served_by),
+        predicted_events: out
+            .predicted_events
+            .into_iter()
+            .filter_map(|event| state.event_name_for_id.get(&event.0).cloned())
+            .collect(),
+        shard_scope_size: out.shard_scope_size,
+    }
+}
+
+fn served_by_label(served_by: ServedBy) -> &'static str {
+    match served_by {
+        ServedBy::FullScan => "full_scan",
+        ServedBy::ShardScan => "shard_scan",
+        ServedBy::Speculative => "speculative",
+        ServedBy::DeltaCache => "delta_cache",
+    }
+}
+
+fn map_hits(state: &State, raw: Vec<(u32, usize)>) -> Vec<QueryHit> {
+    raw.into_iter()
         .enumerate()
         .map(|(rank, (dist, idx))| QueryHit {
             rank: rank + 1,
@@ -240,19 +426,7 @@ fn handle_query(state: &State, body: &str) -> Result<Response<std::io::Cursor<Ve
                 .cloned()
                 .unwrap_or_else(|| "_default".to_string()),
         })
-        .collect();
-
-    let response = QueryResponse {
-        embedder: state.manifest.embedder,
-        embed_us: embed_elapsed.as_micros(),
-        scan_us: scan_elapsed.as_micros(),
-        corpus_size: state.index.len(),
-        hits,
-    };
-    Ok(json_response(
-        200,
-        serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
-    ))
+        .collect()
 }
 
 fn stats_response(state: &State) -> Result<Response<std::io::Cursor<Vec<u8>>>, String> {
@@ -260,6 +434,11 @@ fn stats_response(state: &State) -> Result<Response<std::io::Cursor<Vec<u8>>>, S
     let total_embed = state.total_embed_ns.load(Ordering::Relaxed) as u128;
     let total_scan = state.total_scan_ns.load(Ordering::Relaxed) as u128;
     let denom = queries.max(1) as u128;
+    let sessions = state
+        .sessions
+        .lock()
+        .map_err(|_| "session lock poisoned")?
+        .len();
     let body = StatsResponse {
         corpus_size: state.index.len(),
         embedder: state.manifest.embedder,
@@ -268,6 +447,7 @@ fn stats_response(state: &State) -> Result<Response<std::io::Cursor<Vec<u8>>>, S
         total_scan_us: total_scan / 1000,
         mean_embed_us: (total_embed / 1000) / denom,
         mean_scan_us: (total_scan / 1000) / denom,
+        sessions,
     };
     Ok(json_response(
         200,
@@ -309,8 +489,7 @@ fn build_pipeline(manifest: &Manifest) -> Result<Box<dyn QueryEmbedder>, PrimdEr
 }
 
 fn json_response(status: u16, body: impl Into<String>) -> Response<std::io::Cursor<Vec<u8>>> {
-    let body = body.into();
-    Response::from_string(body)
+    Response::from_string(body.into())
         .with_status_code(StatusCode(status))
         .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
 }
