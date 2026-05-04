@@ -1,0 +1,7 @@
+{"events":["pricing","trial","pricing","support"]}
+{"events":["account","security","support"]}
+{"session":"demo-1","event":"pricing"}
+{"session":"demo-1","event":"trial"}
+{"session":"demo-1","event":"pricing"}
+{"session":"demo-2","event":"support"}
+{"session":"demo-2","event":"security"}

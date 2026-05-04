@@ -6,11 +6,15 @@
 pub mod embed;
 pub mod index;
 pub mod predict;
+pub mod query_context;
 
 pub use embed::binary::{BinarySignature, PcaProjector};
+pub use index::events::EventCatalog;
 pub use index::heap::TopKHeap;
+pub use index::shards::{HierarchicalIndex, SearchOptions, SearchResult};
 pub use index::signatures::SignatureIndex;
-pub use predict::{ConversationState, EventId};
+pub use predict::{ConversationState, EventId, MarkovPredictor};
+pub use query_context::{QueryContext, QueryOutput, ServedBy};
 
 /// Crate-level error type.
 #[derive(Debug, thiserror::Error)]

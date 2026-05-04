@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use super::state::EventId;
 
@@ -39,6 +42,10 @@ impl WeightedCount {
             None => self.weight,
         }
     }
+
+    fn from_weight(weight: f32, now: Instant) -> Self {
+        Self { weight, last: now }
+    }
 }
 
 fn decay_factor(from: Instant, to: Instant, half_life: Duration) -> f32 {
@@ -54,6 +61,22 @@ pub struct MarkovPredictor {
     smoothing: f32,
     max_order: usize,
     half_life: Option<Duration>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPredictor {
+    smoothing: f32,
+    max_order: usize,
+    half_life_secs: Option<f64>,
+    vocab: Vec<u32>,
+    rows: Vec<PersistedRow>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedRow {
+    context: Vec<u32>,
+    next: u32,
+    weight: f32,
 }
 
 impl MarkovPredictor {
@@ -212,6 +235,68 @@ impl MarkovPredictor {
             .map(|w| w.current(Instant::now(), self.half_life))
             .unwrap_or(0.0)
     }
+
+    pub fn save_to_file(&self, path: &Path) -> crate::Result<()> {
+        let now = Instant::now();
+        let mut rows = Vec::new();
+        for table in &self.tables {
+            for (context, nexts) in table {
+                for (&next, count) in nexts {
+                    rows.push(PersistedRow {
+                        context: context.iter().map(|e| e.0).collect(),
+                        next: next.0,
+                        weight: count.current(now, self.half_life),
+                    });
+                }
+            }
+        }
+
+        let persisted = PersistedPredictor {
+            smoothing: self.smoothing,
+            max_order: self.max_order,
+            half_life_secs: self.half_life.map(|d| d.as_secs_f64()),
+            vocab: self.vocab.iter().map(|e| e.0).collect(),
+            rows,
+        };
+        let bytes = serde_json::to_vec_pretty(&persisted)
+            .map_err(|e| crate::PrimdError::Embedder(format!("serialize predictor: {e}")))?;
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(path: &Path) -> crate::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let persisted: PersistedPredictor = serde_json::from_slice(&bytes)
+            .map_err(|e| crate::PrimdError::Embedder(format!("parse predictor: {e}")))?;
+        let mut out = Self::with_order_and_smoothing(persisted.max_order, persisted.smoothing);
+        if let Some(secs) = persisted.half_life_secs {
+            out.half_life = Some(Duration::from_secs_f64(secs));
+        }
+
+        let now = Instant::now();
+        out.vocab = persisted.vocab.into_iter().map(EventId).collect();
+        for row in persisted.rows {
+            let context: Vec<EventId> = row.context.into_iter().map(EventId).collect();
+            let order = context.len();
+            if order == 0 || order > out.max_order {
+                continue;
+            }
+            let next = EventId(row.next);
+            out.tables[order - 1]
+                .entry(context.clone())
+                .or_default()
+                .insert(next, WeightedCount::from_weight(row.weight, now));
+        }
+
+        for (order_idx, table) in out.tables.iter().enumerate() {
+            for (context, row) in table {
+                let total: f32 = row.values().map(|w| w.weight).sum();
+                out.totals[order_idx]
+                    .insert(context.clone(), WeightedCount::from_weight(total, now));
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl Default for MarkovPredictor {
@@ -352,5 +437,18 @@ mod tests {
 
         let preds = m.predict_with_context_at(&[ev(1)], 2, recent + Duration::from_millis(50));
         assert_eq!(preds[0].event, ev(3));
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let mut m = MarkovPredictor::with_order_and_smoothing(2, 0.01);
+        m.observe_sequence(&[ev(1), ev(2), ev(3)]);
+        m.observe_sequence(&[ev(1), ev(2), ev(3)]);
+        let path = std::env::temp_dir().join("primd-markov-test.json");
+        m.save_to_file(&path).unwrap();
+        let loaded = MarkovPredictor::load_from_file(&path).unwrap();
+        let preds = loaded.predict_with_context(&[ev(1), ev(2)], 1);
+        assert_eq!(preds[0].event, ev(3));
+        let _ = std::fs::remove_file(path);
     }
 }

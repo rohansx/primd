@@ -1,6 +1,7 @@
 mod cmd_index;
 mod cmd_query;
 mod cmd_serve;
+mod cmd_train;
 
 use clap::{Parser, Subcommand};
 
@@ -25,6 +26,9 @@ enum Command {
 
     /// Serve an index over HTTP for use as a retrieval microservice.
     Serve(cmd_serve::ServeArgs),
+
+    /// Train a transition matrix from transcript JSONL.
+    Train(cmd_train::TrainArgs),
 }
 
 fn main() {
@@ -33,6 +37,7 @@ fn main() {
         Command::Index(args) => cmd_index::run(args),
         Command::Query(args) => cmd_query::run(args),
         Command::Serve(args) => cmd_serve::run(args),
+        Command::Train(args) => cmd_train::run(args),
     };
 
     if let Err(e) = result {

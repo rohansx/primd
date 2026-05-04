@@ -9,8 +9,9 @@ use serde::Deserialize;
 use primd_core::embed::{
     EmbeddingPipeline, HashedEmbedder, LocalEmbedder, OpenAIEmbedder, random_projection,
 };
-use primd_core::index::signatures::SignatureIndex;
-use primd_core::{BinarySignature, PrimdError};
+use primd_core::{
+    BinarySignature, EventCatalog, HierarchicalIndex, PrimdError, SearchOptions, SignatureIndex,
+};
 
 use crate::cmd_index::{EmbedderKind, LocalModelKind};
 
@@ -58,15 +59,17 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let manifest: Manifest = serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
 
-    let index = SignatureIndex::from_file(&sigs_path)?;
-    if index.len() != manifest.n_entries {
+    let signatures = SignatureIndex::from_file(&sigs_path)?;
+    if signatures.len() != manifest.n_entries {
         return Err(format!(
             "manifest says {} entries but signatures.bin has {}",
             manifest.n_entries,
-            index.len()
+            signatures.len()
         )
         .into());
     }
+    let events = EventCatalog::from_named_scope(&manifest.scope, manifest.n_entries);
+    let index = HierarchicalIndex::new(signatures, events);
 
     let query_text = match args.text {
         Some(t) => t,
@@ -85,11 +88,14 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     let embed_elapsed = embed_start.elapsed();
 
     let scan_start = Instant::now();
-    let results = if args.parallel {
-        index.scan_top_k_parallel(&query_sig, args.top)
-    } else {
-        index.scan_top_k(&query_sig, args.top)
-    };
+    let results = index.search(
+        &query_sig,
+        args.top,
+        &SearchOptions {
+            parallel: args.parallel,
+            ..SearchOptions::default()
+        },
+    );
     let scan_elapsed = scan_start.elapsed();
 
     eprintln!(
@@ -100,7 +106,7 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
         index.len()
     );
 
-    if results.is_empty() {
+    if results.results.is_empty() {
         println!("(no results)");
         return Ok(());
     }
@@ -113,7 +119,7 @@ pub fn run(args: QueryArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("rank  dist  id                    event");
-    for (rank, (dist, idx)) in results.iter().enumerate() {
+    for (rank, (dist, idx)) in results.results.iter().enumerate() {
         let id = manifest.ids.get(*idx).map(|s| s.as_str()).unwrap_or("?");
         let event = event_for.get(idx).map(|s| s.as_str()).unwrap_or("_default");
         println!("{:>4}  {:>4}  {:<20}  {}", rank + 1, dist, id, event);
