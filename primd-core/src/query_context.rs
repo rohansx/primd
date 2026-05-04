@@ -217,7 +217,12 @@ impl QueryContext {
             self.state.observe(next);
         }
 
-        let predicted_events = self.warm_next(index);
+        // Carry through the predictions that drove this turn. Next-turn
+        // prefetch is the caller's responsibility via warm_next, so it can
+        // happen during TTS playback instead of inflating user-visible
+        // finalize latency.
+        let _ = index;
+        let predicted_events = self.predicted_events.clone();
         self.reset_utterance();
         QueryOutput {
             results,

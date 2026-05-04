@@ -54,6 +54,7 @@ fn decay_factor(from: Instant, to: Instant, half_life: Duration) -> f32 {
     (-elapsed * std::f64::consts::LN_2 / hl).exp() as f32
 }
 
+#[derive(Clone)]
 pub struct MarkovPredictor {
     tables: Vec<HashMap<Vec<EventId>, HashMap<EventId, WeightedCount>>>,
     totals: Vec<HashMap<Vec<EventId>, WeightedCount>>,

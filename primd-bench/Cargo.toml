@@ -28,3 +28,7 @@ harness = false
 [[bench]]
 name = "full_pipeline"
 harness = false
+
+[[bench]]
+name = "voice_session"
+harness = false
