@@ -3,7 +3,14 @@ name = "primd-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Sub-millisecond predictive retrieval runtime for voice AI"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Sub-millisecond predictive retrieval runtime for voice AI. Open-source VoiceAgentRAG."
+keywords = ["voice-ai", "rag", "retrieval", "voiceagentrag", "low-latency"]
+categories = ["text-processing", "science", "algorithms"]
+readme = "../README.md"
 
 [dependencies]
 bytemuck.workspace = true

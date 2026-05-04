@@ -3,14 +3,21 @@ name = "primd-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CLI for primd: index, train, serve, benchmark"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "CLI for primd: index, train, serve voice retrieval. Open-source VoiceAgentRAG."
+keywords = ["voice-ai", "rag", "retrieval", "voiceagentrag", "cli"]
+categories = ["command-line-utilities", "text-processing", "science"]
+readme = "../README.md"
 
 [[bin]]
 name = "primd"
 path = "src/main.rs"
 
 [dependencies]
-primd-core = { path = "../primd-core", features = ["openai", "local"] }
+primd-core = { path = "../primd-core", version = "0.1.0", features = ["openai", "local"] }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

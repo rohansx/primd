@@ -8,6 +8,9 @@ edition = "2024"
 license = "Apache-2.0"
 authors = ["Rohan <rohan@primd.dev>"]
 repository = "https://github.com/rohansx/primd"
+homepage = "https://github.com/rohansx/primd"
+readme = "README.md"
+rust-version = "1.85"
 
 [workspace.dependencies]
 bytemuck = { version = "1", features = ["derive"] }
