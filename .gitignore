@@ -27,6 +27,10 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
 
 # Node
 node_modules/
