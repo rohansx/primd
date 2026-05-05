@@ -30,5 +30,3 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
-        env:
-          RUSTFLAGS: "-C target-cpu=native"
