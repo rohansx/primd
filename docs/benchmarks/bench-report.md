@@ -149,13 +149,13 @@ Hybrid uses `SrPredictor` (tabular), not `LowRankSrPredictor`, so it inherits ta
 
 ### What this changes about the v0.2.5 plan
 
-Three concrete v0.2.6 deliverables fall out of this bench:
+Two concrete v0.2.6 deliverables fall out of this bench. A third hypothesis was tested and ruled out.
 
 1. **K is too small at 32.** The "one cache line × 4 SIMD lanes of f64" framing in the strategy memo was a hardware-driven choice; this bench shows it's information-bottlenecked. Try K=64 and K=128. The TD update cost scales as K² but stays well under a microsecond even at K=128 (16 k FMAs).
 2. **Random projection is too lossy.** Replace Achlioptas-style ±1/√K with a PCA projection learned offline from the corpus signatures, or with a sparse random projection (Li et al. 2006) that preserves dot products with lower variance.
-3. **Identity initialization of `M_low` is wrong for paraphrase data.** When the user's next topic is *different* from the current one, biasing `M_low` toward identity (current-feature-aligned prediction) pushes toward within-topic-similar events, which is backwards. Try `M_low = 0` (no prior) or `M_low = γ · uniform-mixing-matrix`.
+3. **Ruled out: `M_low = 0` initialization.** We briefly hypothesized identity initialization was biasing predictions toward within-feature-cluster events. The trade-off is real (identity puts non-zero score on the current event's features, which on paraphrase data partially explains the within-topic bias), but **`M_low = 0` is mathematically wrong**: the TD bootstrap term `M·φ_next` collapses to 0 for every observation, so the (prev → next) association is never learned. The TD update degenerates to accumulating `φ_prev ⊗ φ_prev` rank-1 outer products and predictions stay anchored to the current event's features forever. Identity is the SR-correct default. The `MLowInit` enum is left in the API as a research knob.
 
-These are concrete, measurable, and the harness will tell us which combination works. The v0.2.6 work is to **iterate the low-rank SR implementation against this bench** until the regression closes.
+These are concrete, measurable, and the harness will tell us which combination works. The v0.2.6 work is to **iterate the low-rank SR implementation against this bench** — primarily K and projection quality — until the regression closes.
 
 The strategy memo's claim — "15 % absolute lift from SR over Markov on multi-turn flows" — remains an open hypothesis. v0.2 ships the **infrastructure** to test it; v0.2.6 iterates the implementation until either the hypothesis is proven or we have evidence the synthetic-data direction is wrong and we should pivot to real production-conversation A/B (which depends on partnership with a Pipecat/LiveKit shop).
 

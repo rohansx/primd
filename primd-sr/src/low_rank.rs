@@ -73,7 +73,8 @@ type LowRankMatrix = [[f32; K]; K];
 /// Maintained state:
 /// - `projection`: fixed `256×K` random projection W. Built deterministically
 ///   from the seed; never mutated.
-/// - `m_low`: learned `K×K` SR matrix, initialized to identity.
+/// - `m_low`: learned `K×K` SR matrix. Configurable initialization — see
+///   [`MLowInit`].
 /// - `event_features`: cached `ψ(centroid)` for each known event, computed
 ///   from the corpus signatures the caller supplies at init.
 pub struct LowRankSrPredictor {
@@ -84,6 +85,40 @@ pub struct LowRankSrPredictor {
     eta_base: f32,
     t: u64,
     warmup: u64,
+}
+
+/// How to initialize `M_low` before any observations.
+///
+/// Identity init is the bootstrap-correct default — on the first observation,
+/// `prediction = M·φ_prev = φ_prev` so the TD target absorbs the t=0
+/// self-visit cleanly. BUT on workloads where the user's *next* event lives
+/// in a different topic from the current one, identity-biased predictions
+/// rank within-topic-similar events first, which is exactly backwards
+/// (`paraphrase_ab` bench, 2026-05-14: identity init scored 24.7 % top-1
+/// vs 83.5 % for Markov on a 10-topic paraphrase workload).
+///
+/// Zero init means predictions are empty until `M_low` has been TD-updated
+/// by enough observations to escape the all-zero state — at which point
+/// the predictor has actually learned the data instead of starting biased.
+/// Identity is the SR-correct default: the t=0 self-visit term (visiting
+/// `s_0` once at the start) is carried by `M_low·φ(s_0) = φ(s_0)` which
+/// bootstraps subsequent TD updates correctly. We considered switching to
+/// Zero based on the `paraphrase_ab` finding, but verified Zero breaks the
+/// SR math: with `M_low = 0` the bootstrap term `M·φ_next` collapses to 0
+/// for every update, so the (prev → next) association is never learned —
+/// the TD update degenerates to accumulating `φ_prev ⊗ φ_prev` rank-1
+/// outer products and predictions stay anchored to the current event's
+/// features forever. The right v0.2.6 fixes are K (32 → 64/128) and
+/// projection quality (random → PCA), not init.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum MLowInit {
+    /// `M_low = I`. Bootstrap-correct math; the v0.2 default.
+    #[default]
+    Identity,
+    /// `M_low = 0`. Research knob — see [`MLowInit`] docs for why this is
+    /// not a working default. Useful for SR-from-scratch experiments where
+    /// you want to verify learning dynamics independent of the bootstrap.
+    Zero,
 }
 
 impl LowRankSrPredictor {
@@ -104,6 +139,15 @@ impl LowRankSrPredictor {
         event_centroids: &HashMap<EventId, BinarySignature>,
         seed: u64,
     ) -> Self {
+        Self::with_seed_and_init(event_centroids, seed, MLowInit::default())
+    }
+
+    /// Full constructor exposing the `M_low` initialization. See [`MLowInit`].
+    pub fn with_seed_and_init(
+        event_centroids: &HashMap<EventId, BinarySignature>,
+        seed: u64,
+        init: MLowInit,
+    ) -> Self {
         use rand::Rng;
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -119,13 +163,13 @@ impl LowRankSrPredictor {
             }
         }
 
-        // Identity initialization so bootstrap from M_low · φ(s) ≈ φ(s)
-        // on the first observation — feature-space analogue of M[s,s] = 1
-        // in tabular SR.
         let mut m_low: Box<LowRankMatrix> = Box::new([[0.0; K]; K]);
-        for k in 0..K {
-            m_low[k][k] = 1.0;
+        if matches!(init, MLowInit::Identity) {
+            for k in 0..K {
+                m_low[k][k] = 1.0;
+            }
         }
+        // MLowInit::Zero leaves M_low as the zero matrix.
 
         // Precompute event features from centroids.
         let mut event_features: HashMap<EventId, FeatureVec> =
@@ -143,6 +187,12 @@ impl LowRankSrPredictor {
             t: 0,
             warmup: DEFAULT_WARMUP_OBSERVATIONS,
         }
+    }
+
+    /// Build a predictor with explicit `M_low` initialization. Convenience
+    /// over [`Self::with_seed_and_init`] for the default seed case.
+    pub fn with_init(event_centroids: &HashMap<EventId, BinarySignature>, init: MLowInit) -> Self {
+        Self::with_seed_and_init(event_centroids, DEFAULT_PROJECTION_SEED, init)
     }
 
     pub fn with_gamma(mut self, gamma: f32) -> Self {
