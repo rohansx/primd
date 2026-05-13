@@ -42,3 +42,7 @@ harness = false
 [[bench]]
 name = "predictor_ab"
 harness = false
+
+[[bench]]
+name = "paraphrase_ab"
+harness = false

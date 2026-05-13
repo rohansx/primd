@@ -32,10 +32,21 @@ The headline release: ship the technical artifacts that make the "predictive tur
    - Online TD(0) with η_t = η_base / (1 + 0.01 · t)
    - JSON persistence (`save_to_file` / `load_from_file`)
    - CLI flag: `primd serve --predictor {markov,sr,hybrid}` (default `markov` for v0.2 stability)
-3. ✅ **Low-rank reduction** (2026-05-14) — `W: 256×32` random projection over signature bits; `M_low: 32×32` updated by TD(0). New `LowRankSrPredictor` in `primd-sr/src/low_rank.rs`. Identity initialization for correct bootstrap. 7 unit tests; integrated into the A/B bench. **Pending v0.2.6:** spectral-gap confidence (replace warmth with top-2 eigenvalues of M_low), portable-SIMD TD updates.
-4. ✅ **A/B harness** (2026-05-14) — `predictor_ab` bench measures Markov / SR-tabular / low-rank-SR / Hybrid side-by-side at 1000 utterances with windowed cumulative hit-rates. Validates Hybrid robustness (0 pp regression vs Markov). The empirical SR-over-Markov lift requires a paraphrase-aware adversarial workload that's still pending.
-5. **Per-user persistence** *(v0.2.5)* — `SrPredictor` artifact keyed by `user_id` from the OpenAI `user` field; warm-starts returning users.
-6. **Paraphrase-aware adversarial workload** *(v0.2.6)* — synthetic utterances sharing intent clusters but with differing signatures, designed to differentiate signature-aware SR from EventId-based Markov.
+3. ✅ **Low-rank reduction** (2026-05-14) — `W: 256×32` random projection over signature bits; `M_low: 32×32` updated by TD(0). New `LowRankSrPredictor` in `primd-sr/src/low_rank.rs`. Identity initialization for correct bootstrap. 7 unit tests; integrated into the A/B bench.
+4. ✅ **A/B harness** (2026-05-14) — `predictor_ab` bench measures Markov / SR-tabular / low-rank-SR / Hybrid side-by-side at 1000 utterances with windowed cumulative hit-rates. Validates Hybrid robustness (0 pp regression vs Markov).
+5. ✅ **Paraphrase-aware adversarial workload** (2026-05-14) — `paraphrase_ab` bench, 10 topics × 10 paraphrases, with top-1 / top-K topic-correctness metrics. **Negative result:** low-rank SR underperforms Markov by 58.8 pp on top-1 topic correctness. The K=32 random projection over-pools and the M_low=I initialization biases toward current-feature-aligned (within-topic) prediction. See [bench-report.md § paraphrase_ab](../benchmarks/bench-report.md#paraphrase_ab-results) for the full analysis.
+6. **Per-user persistence** *(v0.2.5)* — `SrPredictor` artifact keyed by `user_id` from the OpenAI `user` field; warm-starts returning users.
+
+### v0.2.6 — iterate low-rank SR against the paraphrase bench
+
+The paraphrase A/B surfaced a real architecture issue with v0.2.5's low-rank SR. v0.2.6 closes it with concrete, measurable iterations:
+
+- **Try K=64 and K=128** — current K=32 is information-bottlenecked. TD update cost scales as K² but stays well under µs even at K=128 (16 k FMAs).
+- **Replace random projection with PCA over corpus signatures, learned offline at index time** — Achlioptas variance is too high at small K. PCA preserves dot products with lower noise.
+- **Fix M_low initialization** — try `M_low = 0` (no prior) or `M_low = γ · uniform` instead of identity. Identity biases toward current-feature-aligned prediction, exactly wrong for paraphrase workloads where the next event is in a *different* topic.
+- **Spectral-gap confidence** — replace the warmth signal with the actual spectral gap of `M_low` (its top-2 eigenvalues). Eigendecomposition of a 32–128 matrix is cheap; can run every N observations and cache.
+- **Iterate against `paraphrase_ab`** — target: low-rank SR top-1 topic correctness ≥ Markov's 83.5 % on this bench.
+- **Multi-step structured workload** — when the right prediction at step *t* depends on horizons longer than 1 step. SR's discount γ captures this; Markov-k needs k as a hyperparameter and sparsifies.
 
 References: Dayan 1993, Stachenfeld et al. 2017 (Nat Neurosci 20:1643–1653), Russek et al. 2017 (Nat Hum Behav 1:680–692), Gershman 2018 (J Neurosci 38:7193). See [successor-representation.md](../architecture/successor-representation.md).
 

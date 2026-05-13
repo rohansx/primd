@@ -104,11 +104,64 @@ The harness does **not** show the 15 % absolute speculative-cache hit-rate lift 
 v0.2.5 work, partial progress as of 2026-05-14:
 
 - ✅ **Low-rank SR shipped** — `W: 256×32, M_low: 32×32` random-projection over signature bits. New `LowRankSrPredictor` in `primd-sr/src/low_rank.rs`, impls `NextTurnPredictor`, integrated into the A/B bench. Tests verify deterministic projection, M_low update, trait object safety, and that unknown events are no-ops.
-- ❌ **Paraphrase-aware adversarial workload** — utterances that share a true intent cluster but differ on signature features (different LSH buckets, same underlying topic). Markov-1 over EventIds treats these as unrelated; signature-aware low-rank SR should share their predictive structure through the projected feature space. Synthesis of this workload is the next deliverable.
+- ✅ **Paraphrase-aware adversarial workload** — see `paraphrase_ab` section below.
 - ❌ **Multi-step structured workload** — conversations where the right prediction at step *t* depends on horizons longer than 1 step. SR's discount γ captures this; Markov-k needs k as a hyperparameter and sparsifies.
 - ❌ **Spectral-gap confidence** — replace the warmth signal with the actual spectral gap of `M_low` (its top-2 eigenvalues). Eigendecomposition of a 32×32 matrix is cheap; can run every N observations and cache.
 
 These are explicit deliverables in [roadmap.md](../plan/roadmap.md) v0.2.5. The bench infrastructure now supports all four predictor configurations side-by-side; the empirical lift requires the adversarial workloads above.
+
+## paraphrase_ab results — and a useful negative result
+
+`primd-bench/benches/paraphrase_ab.rs` builds the paraphrase-aware workload the v0.2.5 roadmap calls for:
+
+- **10 topic clusters × 10 paraphrase-EventIds each = 100 events**, 100 docs/event = 10 k corpus
+- Within-topic events differ by **10 bits** of Hamming drift (LSH-close, but distinct EventIds)
+- Conversations Markov-walk over topics; within a topic the specific paraphrase is uniformly random
+- 1 000 utterances
+- New content-quality metrics: **top-1 topic correctness** and **top-10 topic presence** — does the returned event actually live in the user's intended topic?
+
+This is the design that *should* differentiate signature-feature-aware low-rank SR from EventId-based Markov: Markov-1 sees each `(event_in_A_i → event_in_B_j)` transition with mass `1/100` of the topic A→B probability, so its specific-event predictions spread thin. Low-rank SR pools observations across paraphrases via signature feature similarity. Or that was the hypothesis.
+
+### Actual results
+
+```
+=== paraphrase_ab summary | corpus=10000 docs over 100 events (10 topics × 10) | utterances=1000 | top_k=10 ===
+        markov: finalize p50=1.30us  | cache-hit=100.0% | top1-topic=83.5% | top10-topic=83.5%
+    sr-tabular: finalize p50=1.62us  | cache-hit=100.0% | top1-topic=66.7% | top10-topic=66.7%
+   low-rank-sr: finalize p50=1.31us  | cache-hit=100.0% | top1-topic=24.7% | top10-topic=24.7%
+hybrid-LR(0.5): finalize p50=2.20us  | cache-hit=100.0% | top1-topic=73.4% | top10-topic=73.4%
+
+Low-rank SR vs Markov on PARAPHRASE workload (content quality):
+  top1-topic-correct delta:  -58.8pp
+  top10-topic-present delta: -58.8pp
+```
+
+### Reading the numbers
+
+The cache-hit metric is **100 % across the board** — that's a property of primd's speculation pipeline (signature-level Hamming gate at finalize), not of predictor quality. The interesting metric is **top-1 topic correctness**, which captures whether the returned event actually belongs to the user's intended topic.
+
+- **Markov-only** ranks first at 83.5 %. The variable-order Markov chain learns the topic-level transition pattern despite spreading observations across 10 paraphrases per topic. Laplace smoothing helps; the chain order also helps once `predict_with_context` has length-2+ context.
+- **Tabular SR** is second at 66.7 %. Slightly weaker — SR's discount-horizon ranking puts some non-target-topic events ahead of target-topic ones early in training.
+- **Hybrid (tabular SR + Markov)** falls between the two at 73.4 % — gating toward Markov when SR confidence is low, exactly as designed.
+- **Low-rank SR is the surprise:** 24.7 %, a 58.8 pp regression vs Markov. The K=32 random projection over-pools signature bits, collapsing distinct topics into similar feature vectors. The `M_low = I` initialization pushes early predictions toward "events with similar features to the current one" — which on the paraphrase workload is *the current topic*, not the next one. Markov's empirical-frequency learning recovers fast; the low-rank projection's mistakes persist.
+
+Hybrid uses `SrPredictor` (tabular), not `LowRankSrPredictor`, so it inherits tabular SR's 66.7 % and Markov's 83.5 % as the bounds of its gating range. We could build a low-rank-Hybrid as well, but the underlying low-rank result needs fixing first.
+
+### What this changes about the v0.2.5 plan
+
+Three concrete v0.2.6 deliverables fall out of this bench:
+
+1. **K is too small at 32.** The "one cache line × 4 SIMD lanes of f64" framing in the strategy memo was a hardware-driven choice; this bench shows it's information-bottlenecked. Try K=64 and K=128. The TD update cost scales as K² but stays well under a microsecond even at K=128 (16 k FMAs).
+2. **Random projection is too lossy.** Replace Achlioptas-style ±1/√K with a PCA projection learned offline from the corpus signatures, or with a sparse random projection (Li et al. 2006) that preserves dot products with lower variance.
+3. **Identity initialization of `M_low` is wrong for paraphrase data.** When the user's next topic is *different* from the current one, biasing `M_low` toward identity (current-feature-aligned prediction) pushes toward within-topic-similar events, which is backwards. Try `M_low = 0` (no prior) or `M_low = γ · uniform-mixing-matrix`.
+
+These are concrete, measurable, and the harness will tell us which combination works. The v0.2.6 work is to **iterate the low-rank SR implementation against this bench** until the regression closes.
+
+The strategy memo's claim — "15 % absolute lift from SR over Markov on multi-turn flows" — remains an open hypothesis. v0.2 ships the **infrastructure** to test it; v0.2.6 iterates the implementation until either the hypothesis is proven or we have evidence the synthetic-data direction is wrong and we should pivot to real production-conversation A/B (which depends on partnership with a Pipecat/LiveKit shop).
+
+### Hybrid robustness on the paraphrase workload
+
+The Hybrid wrapper's design promise — "match max(SR, Markov), never worse than either individually" — is *almost* met: hybrid hits 73.4 %, between SR-tabular's 66.7 % and Markov's 83.5 %, biased toward SR-tabular (the default tabular-SR in the wrapper). For deployment, the threshold should probably default lower (closer to 0.7+) so Markov-fallback kicks in until SR is empirically beating Markov on the deployed workload — measurable per-session via the served-by tally.
 
 ## external_baseline results
 
