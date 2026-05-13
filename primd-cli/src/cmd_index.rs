@@ -95,6 +95,10 @@ struct Manifest {
     source_dim: Option<usize>,
     n_entries: usize,
     ids: Vec<String>,
+    /// Original document text per entry, parallel to `ids`. Lets `primd serve`
+    /// return real content (e.g. via the OpenAI-compatible `/v1/chat/completions`
+    /// MoshiRAG adapter) instead of just IDs. Optional for backward compat.
+    texts: Vec<String>,
     scope: BTreeMap<String, Vec<usize>>,
 }
 
@@ -160,6 +164,7 @@ pub fn run(args: IndexArgs) -> Result<(), Box<dyn std::error::Error>> {
         source_dim,
         n_entries: entries.len(),
         ids: entries.iter().map(|e| e.id.clone()).collect(),
+        texts: entries.iter().map(|e| e.text.clone()).collect(),
         scope,
     };
     let manifest_path = args.out.join("manifest.json");

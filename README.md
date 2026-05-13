@@ -118,6 +118,19 @@ curl -s -X POST http://127.0.0.1:8080/query \
   -d '{"text":"is there a free trial","top_k":3}'
 ```
 
+OpenAI-compatible call (the drop-in path for MoshiRAG and any OpenAI-shaped client; see [docs/integrations/moshirag.md](docs/integrations/moshirag.md)):
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"primd",
+    "messages":[{"role":"user","content":"is there a free trial"}],
+    "user":"session-id",
+    "top_k":3
+  }'
+```
+
 Session flow (the path that actually beats vector DBs):
 
 ```bash
@@ -200,6 +213,7 @@ The category is now legible. The back-end slot is empty. primd is the back-end.
 - [Competitive landscape](docs/business/competitive-landscape.md)
 - [Positioning & GTM](docs/business/positioning.md)
 - [Gap analysis](docs/business/gap-analysis.md)
+- [MoshiRAG back-end adapter](docs/integrations/moshirag.md) — OpenAI-compatible `/v1/chat/completions` drop-in for MoshiRAG and any other OpenAI-shaped client
 
 ## Citing
 
