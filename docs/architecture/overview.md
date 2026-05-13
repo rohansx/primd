@@ -65,15 +65,17 @@ See: [layer-1-streaming.md](layer-1-streaming.md)
 
 **Brain analogue**: Hippocampus + boundary/event cells (Zheng et al., 2022) + Sparse Distributed Memory (Kanerva, 1988).
 
-**Purpose**: Replace flat HNSW with a two-level cache-friendly structure.
+**Purpose**: Use a two-stage retrieval that keeps the hot path in cache and bounds the rescan to a small event-scoped subset.
 
-Flat HNSW at 1M+ vectors becomes cache-hostile — every neighbor hop is a pointer chase. primd uses a two-stage approach:
+Two-stage flow:
 
-**Stage 2a — Binary signature scan**: Every document has a 256-bit binary signature (sign-bit quantization of its dense embedding). 1M signatures = 32MB, fits in L2/L3 cache. SIMD-accelerated hamming distance scan finds the right neighborhood in ~0.3-0.5ms.
+**Stage 2a — Binary signature scan** *(shipped, v0.1)*: Every document has a 256-bit binary signature (sign-bit quantization of its dense embedding). 1M signatures = 32MB, fits in L2/L3 cache. SIMD-accelerated Hamming distance scan (AVX-512 VPOPCNTDQ → AVX2 VPSHUFB → scalar fallback) finds the coarse top-K in ~0.3-0.5ms.
 
-**Stage 2b — Per-event HNSW shards**: Documents are grouped into "events" (topically coherent clusters of 100-1000 chunks). Each event has a small HNSW graph. Searching a ~1K-node shard takes ~0.3-0.5ms.
+**Stage 2b — Event-scoped subset rescan** *(shipped, v0.1)*: The coarse top-K is mapped to candidate events via the event catalog. The union of those events' document scopes is gathered into a contiguous buffer and rescanned with the same SIMD kernel to produce the final top-K. This is *not* HNSW — it's a SIMD gather + subset rescan. It works because event scopes are usually small (hundreds to low-thousands of docs) and contiguous, so the gather is cheap and the OS prefetcher does most of the work.
 
-**Combined**: ~0.5-1ms for 1M documents with better p99 than flat HNSW.
+**Stage 2b — Real per-event HNSW shards** *(planned, v0.2)*: For corpora where the event scope itself is ≥ 5–10 k docs, the subset rescan starts to dominate. v0.2 adds an actual HNSW graph per event for that case. See [roadmap.md](../plan/roadmap.md).
+
+**Combined (v0.1)**: ~0.3–0.7 ms for 100 k documents single-thread; the dominant cost is the coarse Hamming scan, not the subset rescan.
 
 See: [layer-2-index.md](layer-2-index.md)
 
@@ -109,12 +111,14 @@ See: [layer-4-coding.md](layer-4-coding.md)
 
 | Scenario | % of Turns (projected) | Latency | Path |
 |---|---|---|---|
-| Topic continuation | 40-50% | <0.1ms | Layer 4 |
-| Predicted pivot (cache hit) | 25-35% | ~0.5-1ms | Layer 3 → Layer 2b |
-| Novel query (full stack) | 15-25% | ~2-4ms | Layer 1 → 2a → 2b |
-| Cold start (first turn) | once | ~5-15ms | Full embed + mmap fault |
+| Topic continuation | 40-50% | <0.1 ms | Layer 4 (delta cache) |
+| Predicted pivot (cache hit) | 25-35% | 1.6 µs (measured) | Layer 3 → speculative cache |
+| Novel query (full stack) | 15-25% | ~150–250 µs at 100 k docs | Layer 1 → 2a → 2b subset rescan |
+| Cold start (first turn) | once | ~5–15 ms | Full embed + mmap fault |
 
-**Projected p50: <1ms. Projected p99: <3ms.**
+**Measured at 100 k docs (`cargo bench --bench voice_session`): finalize p50 1.6 µs, p95 2.8 µs, naive p50 157.8 µs.**
+
+At 1 M docs the v0.1 subset-rescan path will be ~10× slower than the 100 k numbers; v0.2 per-event HNSW closes that gap.
 
 ## Data Flow
 
@@ -122,19 +126,21 @@ See: [layer-4-coding.md](layer-4-coding.md)
 Partial transcript arrives (from STT stream)
     │
     ▼
-Layer 1: Incremental embedding → speculative candidate set (top-100)
+Layer 1: streaming gate → emit signature when partial stabilizes
     │
-    ├── If Layer 4 cache hit (within topic radius)
-    │       └── Return cached results + delta  ──▶  <0.1ms  ──▶  Done
+    ├── If Layer 4 cache hit (delta cache: scope_hash + signature match)
+    │       └── Return cached results  ──▶  <0.1 ms  ──▶  Done
     │
-    ├── If Layer 3 cache hit (prefetched shard is warm)
-    │       └── Search warm HNSW shard  ──▶  ~0.5-1ms  ──▶  Done
+    ├── If Layer 3 + speculation match (finalize signature ≈ speculative signature)
+    │       └── Return speculative cache  ──▶  1.6 µs measured  ──▶  Done
     │
     └── Full path:
-            Layer 2a: Binary signature scan → top-256 events
-            Layer 2b: HNSW search in matching shard → top-K results
-            Rescore with full embeddings → final ranked results
-            ──▶  ~2-4ms  ──▶  Done
+            Layer 2a: SIMD Hamming scan over signatures → coarse top-K
+            Layer 2b: map coarse hits → candidate events → union scope
+                       gather scope into contiguous buffer → SIMD rescan → final top-K
+            ──▶  ~150–250 µs at 100 k docs  ──▶  Done
+
+            (v0.2: replace gather+rescan with per-event HNSW when scope ≥ 5–10 k)
 
 After retrieval:
     │

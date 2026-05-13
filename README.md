@@ -1,46 +1,101 @@
 # primd
 
-**open-source VoiceAgentRAG.** Sub-millisecond predictive retrieval for voice and conversational AI.
+**The predictive turn-cache for real-time conversational AI.**
 
-primd is a Rust runtime that starts retrieving while the user is still speaking, predicts the next likely answer during TTS, and serves repeat questions from a sub-microsecond cache. It implements the dual-agent *fast-talker / slow-thinker* architecture described in [Salesforce VoiceAgentRAG (arXiv:2603.02206, 2026)](https://arxiv.org/abs/2603.02206) — as a single ~10 MB binary you can drop into Pipecat or LiveKit today.
+primd is a 10 MB Apache-2.0 Rust runtime that hides retrieval latency inside the STT and TTS phases of your voice agent. It starts retrieving while the user is still speaking, predicts the next turn during TTS playback, and serves repeats from a sub-microsecond cache.
 
-## The Problem
+```
+   STT partials  ─►  observe_partial   (speculative scan, scoped by predicted events)
+                          │
+   end of speech ─►  finalize          (1.6 µs cache hit if speculation matched)
+                          │
+   TTS playback  ─►  warm_next         (predictor primes next turn's scope)
+```
 
-Voice AI has a dead-air problem. Every other pipeline component has broken its latency barrier:
+## The problem
+
+Voice AI has a dead-air problem. Every other pipeline component has broken its latency wall:
 
 | Component | Best-in-class (2026) |
 |---|---|
 | STT (Deepgram Nova-3) | <200 ms |
-| TTS (Cartesia Sonic 3) | 40 ms |
+| TTS (Cartesia Sonic-3) | 40 ms |
 | LLM TTFT (Groq) | <100 ms |
 | **Retrieval** | **50–300 ms** |
 
-Retrieval is the last unsolved latency wall. A typical vector DB query eats the entire ~200 ms voice budget before the LLM even starts generating. That's the pause that breaks the illusion of natural conversation.
+A typical vector-DB query eats the entire ~200 ms voice budget before the LLM even starts generating. That's the pause that breaks the illusion of natural conversation.
 
-## The Solution
+## The wedge
 
-primd eliminates that pause with four brain-inspired shortcuts:
+primd is not "faster semantic search." It's a runtime that **time-shifts retrieval out of the critical path** by exploiting the timing structure of a voice turn:
 
-1. **Start early** — speculative retrieval on partial transcripts during STT, not at end-of-utterance
-2. **Search smart** — 256-bit binary signatures scan 100k+ docs in microseconds via SIMD, scoped by predicted event
-3. **Predict next** — variable-order Markov predictor pre-warms the next likely answer during TTS playback
-4. **Skip repeats** — predictive-coding delta cache short-circuits topic-continuation queries with zero scan
+- **STT emits partial transcripts** → start scanning before the user is done speaking
+- **TTS playback creates a 1–3 s window** → pre-warm the next turn's scope
+- **Conversations follow topic chains** → topic-continuation queries are zero-scan repeats
+
+The underlying retrieval primitive is 256-bit binary signatures + SIMD Hamming distance (AVX-512 VPOPCNTDQ, AVX2 VPSHUFB nibble-lookup, scalar fallback). 100k docs scanned in ~100 µs. For high-recall workloads primd hands off to your existing vector DB; its job is to make that handoff happen as rarely as possible.
 
 ## Benchmarks
 
 Reproducible: `cargo bench --bench voice_session`. Workload models a Pipecat session: 200 utterances over 20 canonical intents, 4 partial transcripts per turn, 100k-doc corpus across 50 events.
 
-| Phase | What it does | primd p50 | primd p95 | naive p50 |
+| Phase | What it does | primd p50 | primd p95 | Naive p50 |
 |---|---|---|---|---|
 | `observe_partial` | speculative scan during STT | 108 µs | 199 µs | — |
 | **`finalize`** | **end-of-speech retrieval** | **1.6 µs** | **2.8 µs** | **157.8 µs** |
 | `warm_next` | predictor + scope union during TTS | 222 µs | 289 µs | — |
 
-**98× faster than a naive SIMD scan at the user-visible finalize.** 100% speculative-cache hit rate on this workload — every end-of-speech query was already answered before the user finished talking.
+**98× faster than a naive SIMD scan at the user-visible `finalize`.** 100% speculative-cache hit rate on this workload — every end-of-speech query was already answered before the user finished talking. The 1.6 µs is a cache lookup, not magic; it's the cost of work already done during `observe_partial`.
 
-For reference, the best-in-class managed vector DB (Qdrant) reports **4 ms p50** at 1M vectors. primd's finalize p50 is **~2,500× faster** than that — because most of the retrieval has already happened before finalize is called.
+For reference: Qdrant's best-in-class managed vector DB reports **4 ms p50** at 1 M vectors. primd's `finalize` p50 is ~2,500× faster — because most of the retrieval has already happened before `finalize` is called.
 
-## Quick Start
+## Where primd sits in the 2026 voice-AI stack
+
+```
+┌─────────────────────────────────────┐
+│  THE MODEL                          │
+│  Pipecat / LiveKit pipelines        │  ← Pipecat, LiveKit, Vapi, Retell
+│  TML-Interaction-Small, Moshi,      │     (listens, speaks, decides when to retrieve)
+│  GPT-Realtime, Gemini Live          │
+└──────────────┬──────────────────────┘
+               │ delegates retrieval
+               ↓
+┌─────────────────────────────────────┐
+│  THE INTEGRATION PROTOCOL           │
+│  MoshiRAG <ret> token, Pipecat      │  ← Kyutai, Pipecat, LiveKit
+│  FrameProcessor, LiveKit agent      │     (knows when knowledge is needed)
+│  plugins, TM's "background agent"   │
+└──────────────┬──────────────────────┘
+               │ sends query, awaits context
+               ↓
+┌─────────────────────────────────────┐
+│  THE RETRIEVAL BACK-END             │
+│  primd                              │  ← us
+│                                     │     (actually returns docs, fast)
+└─────────────────────────────────────┘
+```
+
+Pipecat's `FrameProcessor` API and Kyutai's MoshiRAG retrieval contract both leave the retrieval back-end open. primd fills exactly that slot, Apache-2.0, Rust-native, and shipping.
+
+## Differentiation
+
+| | primd | Moss / InferEdge | Qdrant / Pinecone | Mem0 / Letta |
+|---|---|---|---|---|
+| **Layer** | retrieval runtime | semantic search runtime | vector database | chat memory |
+| **Latency target** | < 200 µs at finalize | < 10 ms | 4–50 ms | 100–500 ms |
+| **STT-partial speculation** | yes | no | no | no |
+| **TTS-phase pre-warming** | yes | no | no | no |
+| **Repeat-query delta cache** | yes | no | no | no |
+| **License** | Apache-2.0 | PolyForm Shield * | mixed | mixed |
+| **Drops into Pipecat / LiveKit** | yes | yes (design-partner) | via wrappers | via wrappers |
+
+\* PolyForm Shield forbids "production or competing commercial use" of the free tier.
+
+**primd is not competing with vector DBs.** It reads from them. It's not competing with chat memory either — Mem0 / Letta handle who-this-user-is across sessions; primd handles what-they-need-right-now in the current turn.
+
+The only direct overlap is **Moss / InferEdge** (YC F25, sub-10 ms semantic search, Pipecat/LiveKit design partners). Moss has lower raw scan latency on closed-source semantic search; primd has the entire predictive layer Moss doesn't — speculation during STT, pre-warming during TTS, delta cache for topic continuation — plus an Apache-2.0 license that lets you ship without a lawyer.
+
+## Quick start
 
 ```bash
 cargo build --release -p primd-cli
@@ -50,16 +105,12 @@ cargo build --release -p primd-cli
   --out /tmp/primd-faq \
   --embedder hashed
 
-./target/release/primd train \
-  --corpus /tmp/primd-faq \
-  --transcripts examples/transcripts.jsonl
-
 ./target/release/primd serve \
   --index /tmp/primd-faq \
   --bind 127.0.0.1:8080
 ```
 
-Stateless query:
+Stateless query (the slow path — doesn't use any of the predictive layers):
 
 ```bash
 curl -s -X POST http://127.0.0.1:8080/query \
@@ -74,7 +125,7 @@ Session flow (the path that actually beats vector DBs):
 curl -X POST http://127.0.0.1:8080/session/demo/observe \
   -d '{"text":"what about pri","top_k":3}'
 
-# end of speech — return is near-instant if speculation matched
+# end of speech — near-instant if speculation matched
 curl -X POST http://127.0.0.1:8080/session/demo/finalize \
   -d '{"text":"what about pricing","top_k":3}'
 
@@ -84,74 +135,75 @@ curl -X POST http://127.0.0.1:8080/session/demo/warm -d '{}'
 
 ## Architecture
 
-```
-   STT partials  ─►  observe_partial   (speculative scan, scoped by predicted events)
-                          │
-   end of speech ─►  finalize          (1.6µs cache hit if speculation matched)
-                          │
-   TTS playback  ─►  warm_next         (Markov predictor primes next turn's scope)
-```
+Four layers compose in `QueryContext` (`primd-core/src/query_context.rs`):
 
-The four layers compose in `QueryContext` (`primd-core/src/query_context.rs`). Each is documented separately:
+1. **Streaming partials** — speculative scan during STT (`observe_partial`)
+2. **Binary signature index** — 256-bit signatures, SIMD Hamming scan, event-scoped gather + rescan
+3. **Markov predictor + prefetch** — pre-warms next likely scope during TTS (`warm_next`)
+4. **Predictive-coding delta cache** — sub-µs short-circuit for topic-continuation queries
 
+Per-layer docs:
 - [Layer 1 — streaming partials](docs/architecture/layer-1-streaming.md)
 - [Layer 2 — binary signature index](docs/architecture/layer-2-index.md)
 - [Layer 3 — Markov predictor + prefetch](docs/architecture/layer-3-prediction.md)
 - [Layer 4 — predictive coding delta cache](docs/architecture/layer-4-coding.md)
 - [Overview](docs/architecture/overview.md)
 
-## What You Get
+## Status (v0.1.0)
 
-- A single Rust binary (~10 MB)
-- A CLI for indexing, querying, serving, and training predictors
-- A session-aware HTTP API
-- A Pipecat reference integration with Sarvam (STT/LLM/TTS) and Daily transport
-- Apache-2.0 license
+Shipping:
 
-## What It's For
+- SIMD binary signature search (AVX-512 VPOPCNTDQ → AVX2 VPSHUFB → scalar) over event-scoped corpora
+- `QueryContext` session runtime: observe / finalize / warm / reset
+- Session-aware HTTP API
+- Variable-order Markov predictor with half-life time decay, persistence, smoothing
+- Predictive-coding delta cache
+- `pipecat-primd` Python package (`FrameProcessor` + async client)
+- Voice-realistic benchmark harness
 
-- **SDR bots** — eliminate dead air after "what's your pricing?"
-- **Customer support voice agents** — follow-up answers land instantly
-- **In-app voice copilots** — runs as a Pipecat or LiveKit plugin
-- **Healthcare intake, scheduling, dispatch** — any voice AI where pauses kill the conversation
+Roadmap (v0.2):
 
-## What It Isn't
+- `NextTurnPredictor` trait + **Successor Representation predictor** (replaces variable-order Markov with TD(0)-trained low-rank SR; hippocampal predictive map literature)
+- **MoshiRAG back-end adapter** — OpenAI-compatible `/v1/chat/completions` endpoint so MoshiRAG can swap its 3 s vLLM call for primd's sub-200 µs response with one env var change
+- **Real per-event HNSW shards** (currently the event-scoped path is a SIMD gather + subset rescan, not HNSW; see [roadmap](docs/plan/roadmap.md))
+- Public benchmark vs Moss + Qdrant + Pinecone at the *finalize* event, not at `/query`
 
-- **Not a vector database.** Reads from yours (Qdrant, pgvector, parquet files). It's a runtime *on top* of one.
-- **Not chat memory.** Use [Mem0](https://mem0.ai) or [Letta](https://letta.com) for cross-session user memory. primd retrieves knowledge for the current question.
+Roadmap (v0.3):
+
+- `livekit-primd` packaged plugin
+- **Hippocampus Signature DWM cold tier** (first-mover Rust port of arXiv:2602.13594)
+- WASM / browser target
+- Trust primitives — confidence scores, refusal-on-uncertainty
+
+## What primd isn't
+
+- **Not a vector database.** Reads from yours (Qdrant, pgvector, parquet files).
+- **Not chat memory.** Use [Mem0](https://mem0.ai) or [Letta](https://letta.com) for cross-session user memory. primd retrieves knowledge for the *current* question.
 - **Not an agent framework.** Lower in the stack than LangGraph or Pipecat itself.
+- **Not a high-recall retrieval system at extreme scale.** Binary signatures trade some recall for speed; primd targets 10 k–1 M doc corpora where sub-millisecond response matters more than 99th-percentile semantic recall. For larger or recall-sensitive workloads, primd hands off to your vector DB.
 
-## Status
+## Why now
 
-v0.1.0 — voice retrieval runtime, ready to integrate.
+Three signals from the last six months, none of which existed when primd was first prototyped:
 
-Shipping in this release:
-- SIMD binary signature search over event-scoped shards
-- `QueryContext` session runtime (observe / finalize / warm)
-- session-aware HTTP endpoints
-- Markov predictor training and persistence
-- predictive-coding delta cache
-- Pipecat + Sarvam reference example
-- voice-realistic benchmark harness
+1. **Kyutai shipped moshi-rag** (April 2026) — open-sourced the full-duplex retrieval-injection protocol and left the back-end slot generic. Their own docs flag retrieval as the latency bottleneck.
+2. **Thinking Machines announced interaction models** (May 11, 2026) — frontier validation of the background-agent architecture, with explicit acknowledgement that long-session context management is unsolved.
+3. **Production voice (Pipecat, LiveKit, Vapi) is mainstream** — not research anymore. Pipecat alone has thousands of production deployments. All of them pause on retrieval.
 
-Planned next:
-- packaged `pipecat-primd` and `livekit-primd` plugins
-- Python and TypeScript SDKs
-- per-event HNSW shards (currently shard-local subset rescans)
-- WASM/browser target for in-page voice agents
-- trust primitives — confidence scores, dataset freshness, refusal-on-uncertainty
+The category is now legible. The back-end slot is empty. primd is the back-end.
 
 ## Documentation
 
 - [Architecture overview](docs/architecture/overview.md)
-- [Technical specification](docs/tech-spec/technical-specification.md)
+- [Strategy 2026-05](docs/business/strategy-2026-05.md) — why the positioning is what it is
 - [Roadmap](docs/plan/roadmap.md)
-- [Gap analysis](docs/business/gap-analysis.md)
 - [Competitive landscape](docs/business/competitive-landscape.md)
+- [Positioning & GTM](docs/business/positioning.md)
+- [Gap analysis](docs/business/gap-analysis.md)
 
 ## Citing
 
-If you use primd in research, cite both the Salesforce paper (which describes the architecture) and this implementation:
+If you use primd in research, cite both the underlying ideas (predictive map / hippocampal retrieval, dual-agent voice RAG) and this implementation:
 
 ```
 @misc{salesforce2026voiceagentrag,
@@ -159,6 +211,14 @@ If you use primd in research, cite both the Salesforce paper (which describes th
   author = {Salesforce AI Research},
   year   = {2026},
   eprint = {2603.02206},
+  archivePrefix = {arXiv}
+}
+
+@misc{kyutai2026moshirag,
+  title  = {MoshiRAG: Real-Time RAG for Full-Duplex Speech Dialogue},
+  author = {Kyutai},
+  year   = {2026},
+  eprint = {2604.12928},
   archivePrefix = {arXiv}
 }
 ```
