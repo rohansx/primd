@@ -3,7 +3,8 @@ use std::time::Duration;
 use crate::embed::binary::BinarySignature;
 use crate::index::shards::{HierarchicalIndex, SearchOptions};
 use crate::predict::{
-    ConversationState, DeltaCache, EmitDecision, EventId, MarkovPredictor, StreamingQuery,
+    ConversationState, DeltaCache, EmitDecision, EventId, MarkovPredictor, NextTurnPredictor,
+    StreamingQuery,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub struct QueryOutput {
 
 pub struct QueryContext {
     state: ConversationState,
-    predictor: MarkovPredictor,
+    predictor: Box<dyn NextTurnPredictor>,
     gate: StreamingQuery,
     delta_cache: DeltaCache,
     search_options: SearchOptions,
@@ -40,7 +41,15 @@ impl QueryContext {
         Self::with_predictor(MarkovPredictor::new())
     }
 
-    pub fn with_predictor(predictor: MarkovPredictor) -> Self {
+    /// Construct with any concrete predictor. The predictor is boxed; v0.2's
+    /// `SrPredictor` and `HybridPredictor` plug in through the same entry point.
+    pub fn with_predictor<P: NextTurnPredictor + 'static>(predictor: P) -> Self {
+        Self::with_boxed_predictor(Box::new(predictor))
+    }
+
+    /// Construct from an already-boxed predictor — useful when the predictor's
+    /// concrete type is decided at runtime (e.g. loaded from a config flag).
+    pub fn with_boxed_predictor(predictor: Box<dyn NextTurnPredictor>) -> Self {
         Self {
             state: ConversationState::new(8, Duration::from_secs(60)),
             predictor,
@@ -69,7 +78,7 @@ impl QueryContext {
 
         self.predicted_events = self
             .predictor
-            .predict_with_context(&context, self.search_options.max_candidate_events)
+            .predict(&context, self.search_options.max_candidate_events)
             .into_iter()
             .map(|p| p.event)
             .collect();
@@ -191,8 +200,8 @@ impl QueryContext {
         &self.state
     }
 
-    pub fn predictor(&self) -> &MarkovPredictor {
-        &self.predictor
+    pub fn predictor(&self) -> &dyn NextTurnPredictor {
+        self.predictor.as_ref()
     }
 
     pub fn predicted_scope_size(&self) -> usize {
@@ -247,11 +256,13 @@ impl Default for QueryContext {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     use super::*;
     use crate::index::events::EventCatalog;
     use crate::index::shards::HierarchicalIndex;
     use crate::index::signatures::SignatureIndex;
+    use crate::predict::Prediction;
 
     fn sig(seed: u8) -> BinarySignature {
         BinarySignature([seed; 32])
@@ -270,5 +281,51 @@ mod tests {
         let out = ctx.finalize(&index, sig(0x10), 1);
         assert_eq!(out.top_event, Some(EventId(0)));
         assert_eq!(ctx.conversation().last(), Some(EventId(0)));
+    }
+
+    /// Custom predictor that records every observed transition and always
+    /// predicts a fixed event. Used to verify that `QueryContext` flows
+    /// through the trait surface, not the concrete Markov impl.
+    struct RecordingPredictor {
+        always_predict: EventId,
+        observed: Mutex<Vec<(EventId, EventId)>>,
+    }
+
+    impl NextTurnPredictor for RecordingPredictor {
+        fn predict(&self, _context: &[EventId], k: usize) -> Vec<Prediction> {
+            if k == 0 {
+                return Vec::new();
+            }
+            vec![Prediction {
+                event: self.always_predict,
+                probability: 1.0,
+            }]
+        }
+
+        fn observe(&mut self, prev: EventId, next: EventId) {
+            self.observed.lock().unwrap().push((prev, next));
+        }
+    }
+
+    #[test]
+    fn warm_next_uses_injected_predictor() {
+        let signatures = SignatureIndex::new(vec![sig(0x10), sig(0x11), sig(0xF0), sig(0xF1)]);
+        let mut named = BTreeMap::new();
+        named.insert("a".to_string(), vec![0, 1]);
+        named.insert("b".to_string(), vec![2, 3]);
+        let events = EventCatalog::from_named_scope(&named, 4);
+        let index = HierarchicalIndex::new(signatures, events);
+
+        let mut ctx = QueryContext::with_predictor(RecordingPredictor {
+            always_predict: EventId(1),
+            observed: Mutex::new(Vec::new()),
+        });
+
+        // Seed conversation state so warm_next has context.
+        ctx.finalize(&index, sig(0x10), 1);
+        ctx.finalize(&index, sig(0xF0), 1);
+
+        let predicted = ctx.warm_next(&index);
+        assert_eq!(predicted, vec![EventId(1)]);
     }
 }

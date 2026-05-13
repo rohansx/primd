@@ -4,13 +4,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use super::predictor::{NextTurnPredictor, Prediction};
 use super::state::EventId;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Prediction {
-    pub event: EventId,
-    pub probability: f32,
-}
 
 const MIN_CONTEXT_OBSERVATIONS: f32 = 2.0;
 
@@ -303,6 +298,16 @@ impl MarkovPredictor {
 impl Default for MarkovPredictor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl NextTurnPredictor for MarkovPredictor {
+    fn predict(&self, context: &[EventId], k: usize) -> Vec<Prediction> {
+        self.predict_with_context(context, k)
+    }
+
+    fn observe(&mut self, prev: EventId, next: EventId) {
+        MarkovPredictor::observe(self, prev, next)
     }
 }
 

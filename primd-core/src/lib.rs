@@ -13,7 +13,7 @@ pub use index::events::EventCatalog;
 pub use index::heap::TopKHeap;
 pub use index::shards::{HierarchicalIndex, SearchOptions, SearchResult};
 pub use index::signatures::SignatureIndex;
-pub use predict::{ConversationState, EventId, MarkovPredictor};
+pub use predict::{ConversationState, EventId, MarkovPredictor, NextTurnPredictor, Prediction};
 pub use query_context::{QueryContext, QueryOutput, ServedBy};
 
 /// Crate-level error type.
