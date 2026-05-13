@@ -64,9 +64,45 @@ speculative+delta cache hit-rate: markov=100.0%, hybrid=100.0%
 
 The Hybrid predictor's finalize p50 (3.10 µs) is slightly *higher* than pure Markov (1.50 µs), with identical 100 % speculative-hit rate. The synthetic workload is too well-clustered for SR to differentiate from a frequency baseline — every utterance lands in an event whose scope was already pre-warmed.
 
-A real lift requires an adversarial workload with paraphrased turns, longer chains, or context-dependent transitions where Markov fails. That's the v0.2.5 A/B harness work (`primd-sr-bench`).
+A real lift requires an adversarial workload with paraphrased turns, longer chains, or context-dependent transitions where Markov fails. That's the v0.2.5 work — the harness is in place (see the `predictor_ab` bench below), but the lift itself depends on the v0.2.5 low-rank SR (`W: 256×32, M_low: 32×32`) which operates over signature features rather than EventIds.
 
 The right way to read the table: SR + Hybrid is **not a regression** on the well-behaved workload (still beats naive by 42×) and the trait surface is in place for the harder workload measurements. The Markov-only path remains the v0.2 default; switch to `--predictor hybrid` when SR's properties (paraphrase generalization, soft horizon) are needed.
+
+## predictor_ab results
+
+`primd-bench/benches/predictor_ab.rs` runs the same `voice_session`-style workload but extends to **1000 utterances** under three predictor configurations (Markov-only, SR-only, Hybrid(threshold=0.5)) and measures cumulative cache-hit rate at 200 / 500 / 1000 utterance windows so SR's warmup ramp shows up if it exists.
+
+```
+=== predictor_ab summary | corpus=100000 docs over 50 events | utterances=1000 | top_k=10 ===
+   markov-only: finalize p50=1.15us p95=1.95us p99=2.42us | cache-hit overall=100.0%
+       sr-only: finalize p50=1.69us p95=2.77us p99=4.09us | cache-hit overall=100.0%
+   hybrid(0.5): finalize p50=3.05us p95=5.55us p99=9.01us | cache-hit overall=100.0%
+
+Hybrid robustness: markov_hit=100.0% hybrid_hit=100.0% (regression=0.0pp)
+```
+
+Windowed cumulative hit rates: 100 % at every window for every predictor on this workload — the structural prediction is trivially correct because the underlying intent distribution has low entropy.
+
+### What this actually proves
+
+The harness validates **Hybrid robustness**: the SR + Markov wrapper does not regress relative to Markov-only on cache hit rate (0 pp regression). The slight finalize-p50 overhead (3.05 µs vs 1.15 µs) is the cost of the wrapper's dispatch + dual-predictor observe call — a few extra HashMap operations per turn, irrelevant relative to the µs scale.
+
+### What it does NOT prove
+
+The harness does **not** show the 15 % absolute speculative-cache hit-rate lift the strategy memo projects from SR. Two reasons:
+
+1. **The synthetic workload is too easy.** Both Markov-1 and tabular SR can predict the right cluster reliably when intents are well-separated and conversation transitions are simple. There's no room for either predictor to be wrong, so there's no room for SR to be more right.
+2. **v0.2 tabular SR operates over EventIds, not signature features.** Tabular SR's top-K from `M[s, :]` converges to roughly the same ranking as Markov-1's top-K from the empirical transition distribution. The "paraphrase generalization" lift requires SR to share predictive structure across states with similar features — which means signature-based features, which means the v0.2.5 low-rank reduction `W: 256×K, M_low: K×K`.
+
+### What needs to happen for the lift to be measurable
+
+v0.2.5 work, all aligned with the strategy memo:
+
+- **Low-rank SR** — `W: 256×32, M_low: 32×32` operating over signature bits, so events with similar signatures share rows. Slots in as a third `NextTurnPredictor` impl behind the existing trait surface.
+- **Paraphrase-aware adversarial workload** — utterances that share a true intent cluster but differ on signature features (different LSH buckets, same underlying topic). Markov-1 over EventIds treats these as unrelated; signature-aware SR shares their predictive structure.
+- **Multi-step structured workload** — conversations where the right prediction at step *t* depends on horizons longer than 1 step. SR's discount γ captures this; Markov-k needs k as a hyperparameter and sparsifies.
+
+These are explicit deliverables in [roadmap.md](../plan/roadmap.md) v0.2.5. The current bench is the measurement infrastructure that v0.2.5 will use to validate them.
 
 ## external_baseline results
 

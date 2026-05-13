@@ -38,3 +38,7 @@ harness = false
 [[bench]]
 name = "external_baseline"
 harness = false
+
+[[bench]]
+name = "predictor_ab"
+harness = false
