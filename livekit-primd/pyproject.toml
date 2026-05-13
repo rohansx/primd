@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "livekit-primd"
+version = "0.1.0"
+description = "Sub-millisecond predictive retrieval for LiveKit Agents. Open-source VoiceAgentRAG."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Rohan", email = "hello@rohan.sh" }]
+keywords = [
+  "livekit",
+  "livekit-agents",
+  "voice-ai",
+  "rag",
+  "retrieval",
+  "voiceagentrag",
+  "primd",
+  "low-latency",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+livekit = ["livekit-agents>=0.10"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.6"]
+
+[project.urls]
+Homepage = "https://github.com/rohansx/primd"
+Repository = "https://github.com/rohansx/primd"
+Issues = "https://github.com/rohansx/primd/issues"
+Documentation = "https://github.com/rohansx/primd#readme"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livekit_primd"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

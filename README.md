@@ -217,6 +217,7 @@ The category is now legible. The back-end slot is empty. primd is the back-end.
 - [Positioning & GTM](docs/business/positioning.md)
 - [Gap analysis](docs/business/gap-analysis.md)
 - [MoshiRAG back-end adapter](docs/integrations/moshirag.md) — OpenAI-compatible `/v1/chat/completions` drop-in for MoshiRAG and any other OpenAI-shaped client
+- [LiveKit Agents integration](docs/integrations/livekit.md) — `livekit-primd` package + wiring pattern
 
 ## Citing
 
