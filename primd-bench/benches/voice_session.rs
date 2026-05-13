@@ -28,6 +28,7 @@ use primd_core::index::shards::{HierarchicalIndex, SearchOptions};
 use primd_core::index::signatures::SignatureIndex;
 use primd_core::predict::{EventId, MarkovPredictor};
 use primd_core::query_context::{QueryContext, ServedBy};
+use primd_sr::{HybridPredictor, SrPredictor};
 
 const SEED: u64 = 0xCAFE_F00D;
 const VOCAB: u32 = 50;
@@ -199,12 +200,11 @@ impl ServedTally {
     }
 }
 
-fn run_primd_session(
+fn run_primd_session_inner(
     index: &HierarchicalIndex,
-    predictor: &MarkovPredictor,
+    mut ctx: QueryContext,
     workload: &[Utterance],
 ) -> (PhaseStats, PhaseStats, PhaseStats, ServedTally) {
-    let mut ctx = QueryContext::with_predictor(predictor.clone());
     let mut observe = PhaseStats::default();
     let mut finalize = PhaseStats::default();
     let mut warm = PhaseStats::default();
@@ -228,6 +228,35 @@ fn run_primd_session(
     (observe, finalize, warm, served)
 }
 
+fn run_primd_session(
+    index: &HierarchicalIndex,
+    predictor: &MarkovPredictor,
+    workload: &[Utterance],
+) -> (PhaseStats, PhaseStats, PhaseStats, ServedTally) {
+    let ctx = QueryContext::with_predictor(predictor.clone());
+    // Warm the Markov from the persisted state by re-feeding through the
+    // QueryContext below; the cloned predictor already carries it.
+    run_primd_session_inner(index, ctx, workload)
+}
+
+fn run_primd_hybrid_session(
+    index: &HierarchicalIndex,
+    predictor: &MarkovPredictor,
+    workload: &[Utterance],
+) -> (PhaseStats, PhaseStats, PhaseStats, ServedTally) {
+    // Hybrid: SR starts cold, Markov serves until SR confidence crosses
+    // threshold. Use a moderate warmup so SR gates in partway through the
+    // 200-utterance workload — mirrors a real session where the first few
+    // turns run on the prior, then the learned predictor takes over.
+    let hybrid = HybridPredictor::new(
+        SrPredictor::new().with_warmup(40).with_gamma(0.9),
+        predictor.clone(),
+    )
+    .with_threshold(0.5);
+    let ctx = QueryContext::with_predictor(hybrid);
+    run_primd_session_inner(index, ctx, workload)
+}
+
 fn run_naive_session(index: &HierarchicalIndex, workload: &[Utterance]) -> PhaseStats {
     let opts = SearchOptions::default();
     let mut finalize = PhaseStats::default();
@@ -246,9 +275,15 @@ fn bench_voice_session(c: &mut Criterion) {
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(8));
 
-    group.bench_function("primd_full_pipeline", |b| {
+    group.bench_function("primd_markov_pipeline", |b| {
         b.iter(|| {
             let _ = run_primd_session(&index, &predictor, &workload);
+        });
+    });
+
+    group.bench_function("primd_hybrid_pipeline", |b| {
+        b.iter(|| {
+            let _ = run_primd_hybrid_session(&index, &predictor, &workload);
         });
     });
 
@@ -261,7 +296,9 @@ fn bench_voice_session(c: &mut Criterion) {
     group.finish();
 
     // Standalone summary run for human-readable numbers in CI logs / README.
-    let (obs, fin, warm, served) = run_primd_session(&index, &predictor, &workload);
+    let (obs_m, fin_m, warm_m, served_m) = run_primd_session(&index, &predictor, &workload);
+    let (obs_h, fin_h, warm_h, served_h) =
+        run_primd_hybrid_session(&index, &predictor, &workload);
     let naive_fin = run_naive_session(&index, &workload);
 
     println!();
@@ -269,16 +306,44 @@ fn bench_voice_session(c: &mut Criterion) {
         "=== voice_session summary | corpus={} docs over {} events | utterances={} | top_k={} ===",
         TOTAL_SIGS, VOCAB, N_UTTERANCES, TOP_K
     );
-    println!("{}", obs.report("observe_partial"));
-    println!("{}", fin.report("finalize_primd"));
-    println!("{}", warm.report("warm_next"));
-    println!("{}", naive_fin.report("finalize_naive"));
-    println!("{}", served.report());
+    println!("--- markov-only predictor ---");
+    println!("{}", obs_m.report("observe_partial"));
+    println!("{}", fin_m.report("finalize_primd"));
+    println!("{}", warm_m.report("warm_next"));
+    println!("{}", served_m.report());
 
-    if let (Some(p_med), Some(n_med)) = (median(&fin.samples), median(&naive_fin.samples)) {
+    println!("--- hybrid (SR + markov) predictor ---");
+    println!("{}", obs_h.report("observe_partial"));
+    println!("{}", fin_h.report("finalize_primd"));
+    println!("{}", warm_h.report("warm_next"));
+    println!("{}", served_h.report());
+
+    println!("--- baseline ---");
+    println!("{}", naive_fin.report("finalize_naive"));
+
+    if let (Some(p_med), Some(n_med)) = (median(&fin_m.samples), median(&naive_fin.samples)) {
         let speedup = n_med as f64 / p_med.max(1) as f64;
-        println!("primd finalize p50 vs naive p50: {:.1}x faster", speedup);
+        println!(
+            "primd-markov finalize p50 vs naive p50: {:.1}x faster",
+            speedup
+        );
     }
+    if let (Some(p_med), Some(n_med)) = (median(&fin_h.samples), median(&naive_fin.samples)) {
+        let speedup = n_med as f64 / p_med.max(1) as f64;
+        println!(
+            "primd-hybrid finalize p50 vs naive p50: {:.1}x faster",
+            speedup
+        );
+    }
+    let hit_rate = |s: &ServedTally| {
+        let n = s.total().max(1);
+        100.0 * (s.speculative + s.delta_cache) as f64 / n as f64
+    };
+    println!(
+        "speculative+delta cache hit-rate: markov={:.1}%, hybrid={:.1}%",
+        hit_rate(&served_m),
+        hit_rate(&served_h),
+    );
 }
 
 fn median(samples: &[u128]) -> Option<u128> {

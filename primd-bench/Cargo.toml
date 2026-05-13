@@ -8,10 +8,12 @@ publish = false
 
 [dependencies]
 primd-core = { path = "../primd-core" }
+primd-sr = { path = "../primd-sr" }
 rand.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+instant-distance = "0.6"
 
 [[bench]]
 name = "binary_scan"
@@ -31,4 +33,8 @@ harness = false
 
 [[bench]]
 name = "voice_session"
+harness = false
+
+[[bench]]
+name = "external_baseline"
 harness = false

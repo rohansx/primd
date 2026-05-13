@@ -49,6 +49,8 @@ Reproducible: `cargo bench --bench voice_session`. Workload models a Pipecat ses
 
 For reference: Qdrant's best-in-class managed vector DB reports **4 ms p50** at 1 M vectors. primd's `finalize` p50 is ~2,500× faster — because most of the retrieval has already happened before `finalize` is called.
 
+Full bench report (including an in-memory HNSW baseline via `instant-distance`, hardware notes, and honest framing) is at [docs/benchmarks/bench-report.md](docs/benchmarks/bench-report.md).
+
 ## Where primd sits in the 2026 voice-AI stack
 
 ```
@@ -216,6 +218,7 @@ The category is now legible. The back-end slot is empty. primd is the back-end.
 - [Competitive landscape](docs/business/competitive-landscape.md)
 - [Positioning & GTM](docs/business/positioning.md)
 - [Gap analysis](docs/business/gap-analysis.md)
+- [Benchmark report](docs/benchmarks/bench-report.md) — primd-Markov vs primd-Hybrid vs naive vs in-memory HNSW, with honest framing
 - [MoshiRAG back-end adapter](docs/integrations/moshirag.md) — OpenAI-compatible `/v1/chat/completions` drop-in for MoshiRAG and any other OpenAI-shaped client
 - [LiveKit Agents integration](docs/integrations/livekit.md) — `livekit-primd` package + wiring pattern
 
