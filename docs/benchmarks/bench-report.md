@@ -74,14 +74,19 @@ The right way to read the table: SR + Hybrid is **not a regression** on the well
 
 ```
 === predictor_ab summary | corpus=100000 docs over 50 events | utterances=1000 | top_k=10 ===
-   markov-only: finalize p50=1.15us p95=1.95us p99=2.42us | cache-hit overall=100.0%
-       sr-only: finalize p50=1.69us p95=2.77us p99=4.09us | cache-hit overall=100.0%
-   hybrid(0.5): finalize p50=3.05us p95=5.55us p99=9.01us | cache-hit overall=100.0%
+   markov-only: finalize p50=1.22us p95=2.06us p99=2.79us | cache-hit overall=100.0%
+       sr-only: finalize p50=1.47us p95=2.16us p99=2.71us | cache-hit overall=100.0%
+   low-rank-sr: finalize p50=1.39us p95=1.90us p99=2.21us | cache-hit overall=100.0%
+   hybrid(0.5): finalize p50=2.52us p95=3.89us p99=5.89us | cache-hit overall=100.0%
 
-Hybrid robustness: markov_hit=100.0% hybrid_hit=100.0% (regression=0.0pp)
+Cache-hit summary: markov=100.0% sr-tabular=100.0% low-rank=100.0% hybrid=100.0%
+Hybrid robustness target: hybrid >= markov - 2pp (regression=0.0pp)
+Low-rank SR vs Markov delta: +0.0pp
 ```
 
 Windowed cumulative hit rates: 100 % at every window for every predictor on this workload — the structural prediction is trivially correct because the underlying intent distribution has low entropy.
+
+**Interesting finalize p50 ranking on this workload:** Markov (1.22 µs) < low-rank-SR (1.39 µs) < tabular-SR (1.47 µs) < Hybrid (2.52 µs). Low-rank SR is *faster* than tabular SR because predict reduces to a 32-dim matrix-vector + 50 32-dim dot products = ~3 200 FMAs, where tabular SR has to scan the entire sparse-row `HashMap` for the current state. Markov is the fastest because its inherent `predict_with_context` is a hot-path lookup into a flat HashMap.
 
 ### What this actually proves
 
@@ -96,13 +101,14 @@ The harness does **not** show the 15 % absolute speculative-cache hit-rate lift 
 
 ### What needs to happen for the lift to be measurable
 
-v0.2.5 work, all aligned with the strategy memo:
+v0.2.5 work, partial progress as of 2026-05-14:
 
-- **Low-rank SR** — `W: 256×32, M_low: 32×32` operating over signature bits, so events with similar signatures share rows. Slots in as a third `NextTurnPredictor` impl behind the existing trait surface.
-- **Paraphrase-aware adversarial workload** — utterances that share a true intent cluster but differ on signature features (different LSH buckets, same underlying topic). Markov-1 over EventIds treats these as unrelated; signature-aware SR shares their predictive structure.
-- **Multi-step structured workload** — conversations where the right prediction at step *t* depends on horizons longer than 1 step. SR's discount γ captures this; Markov-k needs k as a hyperparameter and sparsifies.
+- ✅ **Low-rank SR shipped** — `W: 256×32, M_low: 32×32` random-projection over signature bits. New `LowRankSrPredictor` in `primd-sr/src/low_rank.rs`, impls `NextTurnPredictor`, integrated into the A/B bench. Tests verify deterministic projection, M_low update, trait object safety, and that unknown events are no-ops.
+- ❌ **Paraphrase-aware adversarial workload** — utterances that share a true intent cluster but differ on signature features (different LSH buckets, same underlying topic). Markov-1 over EventIds treats these as unrelated; signature-aware low-rank SR should share their predictive structure through the projected feature space. Synthesis of this workload is the next deliverable.
+- ❌ **Multi-step structured workload** — conversations where the right prediction at step *t* depends on horizons longer than 1 step. SR's discount γ captures this; Markov-k needs k as a hyperparameter and sparsifies.
+- ❌ **Spectral-gap confidence** — replace the warmth signal with the actual spectral gap of `M_low` (its top-2 eigenvalues). Eigendecomposition of a 32×32 matrix is cheap; can run every N observations and cache.
 
-These are explicit deliverables in [roadmap.md](../plan/roadmap.md) v0.2.5. The current bench is the measurement infrastructure that v0.2.5 will use to validate them.
+These are explicit deliverables in [roadmap.md](../plan/roadmap.md) v0.2.5. The bench infrastructure now supports all four predictor configurations side-by-side; the empirical lift requires the adversarial workloads above.
 
 ## external_baseline results
 

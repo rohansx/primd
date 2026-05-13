@@ -16,3 +16,4 @@ readme = "../README.md"
 primd-core = { path = "../primd-core", version = "0.1" }
 serde.workspace = true
 serde_json.workspace = true
+rand.workspace = true

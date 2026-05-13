@@ -23,6 +23,9 @@
 //! for primd's typical voice corpora (tens to low hundreds of events) and
 //! cheap enough that the optimization isn't on any critical path yet.
 
+pub mod low_rank;
+pub use low_rank::{LowRankSrPredictor, K as LOW_RANK_K, SIG_BITS as LOW_RANK_SIG_BITS};
+
 use std::collections::{HashMap, HashSet};
 
 use primd_core::predict::{EventId, MarkovPredictor, NextTurnPredictor, Prediction};

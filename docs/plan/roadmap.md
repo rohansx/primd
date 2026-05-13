@@ -32,9 +32,10 @@ The headline release: ship the technical artifacts that make the "predictive tur
    - Online TD(0) with η_t = η_base / (1 + 0.01 · t)
    - JSON persistence (`save_to_file` / `load_from_file`)
    - CLI flag: `primd serve --predictor {markov,sr,hybrid}` (default `markov` for v0.2 stability)
-3. **Low-rank reduction** *(v0.2.5)* — `W: 256×32`, `M_low: 32×32` with spectral-gap confidence and portable-SIMD TD updates. Trait surface stays the same; low-rank slots in as a third impl.
-4. **A/B harness** *(v0.2.5)* — 1000-conversation eval corpus, measure speculative-cache hit rate of Hybrid vs pure Markov. Target: ≥ 15 % absolute lift on conversations with ≥ 5 turns.
+3. ✅ **Low-rank reduction** (2026-05-14) — `W: 256×32` random projection over signature bits; `M_low: 32×32` updated by TD(0). New `LowRankSrPredictor` in `primd-sr/src/low_rank.rs`. Identity initialization for correct bootstrap. 7 unit tests; integrated into the A/B bench. **Pending v0.2.6:** spectral-gap confidence (replace warmth with top-2 eigenvalues of M_low), portable-SIMD TD updates.
+4. ✅ **A/B harness** (2026-05-14) — `predictor_ab` bench measures Markov / SR-tabular / low-rank-SR / Hybrid side-by-side at 1000 utterances with windowed cumulative hit-rates. Validates Hybrid robustness (0 pp regression vs Markov). The empirical SR-over-Markov lift requires a paraphrase-aware adversarial workload that's still pending.
 5. **Per-user persistence** *(v0.2.5)* — `SrPredictor` artifact keyed by `user_id` from the OpenAI `user` field; warm-starts returning users.
+6. **Paraphrase-aware adversarial workload** *(v0.2.6)* — synthetic utterances sharing intent clusters but with differing signatures, designed to differentiate signature-aware SR from EventId-based Markov.
 
 References: Dayan 1993, Stachenfeld et al. 2017 (Nat Neurosci 20:1643–1653), Russek et al. 2017 (Nat Hum Behav 1:680–692), Gershman 2018 (J Neurosci 38:7193). See [successor-representation.md](../architecture/successor-representation.md).
 

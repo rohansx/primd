@@ -29,13 +29,15 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use std::collections::HashMap;
+
 use primd_core::embed::binary::BinarySignature;
 use primd_core::index::events::EventCatalog;
 use primd_core::index::shards::HierarchicalIndex;
 use primd_core::index::signatures::SignatureIndex;
 use primd_core::predict::{EventId, MarkovPredictor, NextTurnPredictor};
 use primd_core::query_context::{QueryContext, ServedBy};
-use primd_sr::{HybridPredictor, SrPredictor};
+use primd_sr::{HybridPredictor, LowRankSrPredictor, SrPredictor};
 
 const SEED: u64 = 0xCAFE_F00D;
 const VOCAB: u32 = 50;
@@ -66,7 +68,12 @@ struct Utterance {
     final_sig: BinarySignature,
 }
 
-fn build_corpus_and_workload() -> (HierarchicalIndex, MarkovPredictor, Vec<Utterance>) {
+fn build_corpus_and_workload() -> (
+    HierarchicalIndex,
+    MarkovPredictor,
+    Vec<Utterance>,
+    HashMap<EventId, BinarySignature>,
+) {
     let mut rng = StdRng::seed_from_u64(SEED);
 
     let mut sigs = Vec::with_capacity(TOTAL_SIGS);
@@ -135,7 +142,16 @@ fn build_corpus_and_workload() -> (HierarchicalIndex, MarkovPredictor, Vec<Utter
         });
     }
 
-    (index, markov, utts)
+    // Event centroids = per-event centroid signatures the corpus was built
+    // from. Low-rank SR uses these to compute its random-projection-based
+    // event features.
+    let centroids_map: HashMap<EventId, BinarySignature> = centroids
+        .into_iter()
+        .enumerate()
+        .map(|(i, sig)| (EventId(i as u32), sig))
+        .collect();
+
+    (index, markov, utts, centroids_map)
 }
 
 #[derive(Default, Clone)]
@@ -245,13 +261,28 @@ fn run_session(
     r
 }
 
-fn run_all(index: &HierarchicalIndex, markov: &MarkovPredictor, workload: &[Utterance]) -> Vec<PredictorResult> {
+fn run_all(
+    index: &HierarchicalIndex,
+    markov: &MarkovPredictor,
+    workload: &[Utterance],
+    centroids: &HashMap<EventId, BinarySignature>,
+) -> Vec<PredictorResult> {
     let markov_only = run_session("markov-only", index, workload, Box::new(markov.clone()));
     let sr_only = run_session(
         "sr-only",
         index,
         workload,
         Box::new(SrPredictor::new().with_warmup(40).with_gamma(0.9)),
+    );
+    let low_rank = run_session(
+        "low-rank-sr",
+        index,
+        workload,
+        Box::new(
+            LowRankSrPredictor::new(centroids)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
     );
     let hybrid = run_session(
         "hybrid(0.5)",
@@ -265,11 +296,11 @@ fn run_all(index: &HierarchicalIndex, markov: &MarkovPredictor, workload: &[Utte
             .with_threshold(0.5),
         ),
     );
-    vec![markov_only, sr_only, hybrid]
+    vec![markov_only, sr_only, low_rank, hybrid]
 }
 
 fn bench_predictor_ab(c: &mut Criterion) {
-    let (index, markov, workload) = build_corpus_and_workload();
+    let (index, markov, workload, centroids) = build_corpus_and_workload();
 
     let mut group = c.benchmark_group("predictor_ab");
     group.sample_size(10);
@@ -281,6 +312,21 @@ fn bench_predictor_ab(c: &mut Criterion) {
                 &index,
                 &workload,
                 Box::new(markov.clone()),
+            );
+        });
+    });
+
+    group.bench_function("low_rank_session_1000utts", |b| {
+        b.iter(|| {
+            let _ = run_session(
+                "low-rank",
+                &index,
+                &workload,
+                Box::new(
+                    LowRankSrPredictor::new(&centroids)
+                        .with_warmup(40)
+                        .with_gamma(0.9),
+                ),
             );
         });
     });
@@ -305,7 +351,7 @@ fn bench_predictor_ab(c: &mut Criterion) {
     group.finish();
 
     // Human-readable comparison for the bench report.
-    let results = run_all(&index, &markov, &workload);
+    let results = run_all(&index, &markov, &workload, &centroids);
     println!();
     println!(
         "=== predictor_ab summary | corpus={} docs over {} events | utterances={} | top_k={} ===",
@@ -317,16 +363,24 @@ fn bench_predictor_ab(c: &mut Criterion) {
 
     // Hybrid robustness assertion (informational, not a hard failure in bench):
     let markov_hit = results[0].served_overall.hit_pct();
-    let hybrid_hit = results[2].served_overall.hit_pct();
-    let regression = markov_hit - hybrid_hit;
+    let low_rank_hit = results[2].served_overall.hit_pct();
+    let hybrid_hit = results[3].served_overall.hit_pct();
     println!();
     println!(
-        "Hybrid robustness: markov_hit={:.1}% hybrid_hit={:.1}% (regression={:.1}pp)",
-        markov_hit, hybrid_hit, regression
+        "Cache-hit summary: markov={:.1}% sr-tabular={:.1}% low-rank={:.1}% hybrid={:.1}%",
+        markov_hit,
+        results[1].served_overall.hit_pct(),
+        low_rank_hit,
+        hybrid_hit,
     );
     println!(
-        "(target: hybrid >= markov - 2pp; tabular SR matches Markov on this workload, \
-         lift requires v0.2.5 low-rank signature-aware SR)"
+        "Hybrid robustness target: hybrid >= markov - 2pp (regression={:.1}pp)",
+        markov_hit - hybrid_hit,
+    );
+    println!(
+        "Low-rank SR vs Markov delta: {:+.1}pp (positive = low-rank wins; on this synthetic, \
+         well-clustered workload neither variant has room to differentiate)",
+        low_rank_hit - markov_hit,
     );
 }
 
