@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
@@ -15,6 +15,7 @@ use primd_core::{
     BinarySignature, EventCatalog, HierarchicalIndex, MarkovPredictor, PrimdError, QueryContext,
     QueryOutput, SearchOptions, ServedBy, SignatureIndex,
 };
+use primd_sr::{HybridPredictor, SrPredictor};
 
 use crate::cmd_index::{EmbedderKind, LocalModelKind};
 
@@ -25,6 +26,21 @@ pub struct ServeArgs {
 
     #[arg(long, default_value = "127.0.0.1:8080")]
     pub bind: String,
+
+    /// Next-turn predictor implementation:
+    ///   `markov` — variable-order Markov (v0.1 default, persistence-aware)
+    ///   `sr`     — pure Successor Representation (cold-starts uniform)
+    ///   `hybrid` — SR + Markov; Markov serves cold-start, SR takes over once warm
+    #[arg(long, value_enum, default_value_t = PredictorKind::Markov)]
+    pub predictor: PredictorKind,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+#[clap(rename_all = "lowercase")]
+pub enum PredictorKind {
+    Markov,
+    Sr,
+    Hybrid,
 }
 
 #[derive(Deserialize, Clone)]
@@ -125,6 +141,7 @@ struct State {
     text_for_id: HashMap<String, String>,
     pipeline: Box<dyn QueryEmbedder>,
     predictor_path: Option<PathBuf>,
+    predictor_kind: PredictorKind,
     sessions: Mutex<HashMap<String, QueryContext>>,
     queries_served: AtomicU64,
     total_embed_ns: AtomicU64,
@@ -140,13 +157,24 @@ impl State {
             .fetch_add(scan_ns as u64, Ordering::Relaxed);
     }
 
-    fn new_session(&self) -> QueryContext {
-        let predictor = self
-            .predictor_path
+    /// Load the persisted Markov state if a `transitions.json` was found at
+    /// index-time. Used for both `markov` and `hybrid` predictor kinds.
+    fn load_markov(&self) -> MarkovPredictor {
+        self.predictor_path
             .as_ref()
             .and_then(|path| MarkovPredictor::load_from_file(path).ok())
-            .unwrap_or_default();
-        QueryContext::with_predictor(predictor)
+            .unwrap_or_default()
+    }
+
+    fn new_session(&self) -> QueryContext {
+        match self.predictor_kind {
+            PredictorKind::Markov => QueryContext::with_predictor(self.load_markov()),
+            PredictorKind::Sr => QueryContext::with_predictor(SrPredictor::new()),
+            PredictorKind::Hybrid => QueryContext::with_predictor(HybridPredictor::new(
+                SrPredictor::new(),
+                self.load_markov(),
+            )),
+        }
     }
 }
 
@@ -196,6 +224,7 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         text_for_id,
         pipeline,
         predictor_path: transitions_path.exists().then_some(transitions_path),
+        predictor_kind: args.predictor,
         sessions: Mutex::new(HashMap::new()),
         queries_served: AtomicU64::new(0),
         total_embed_ns: AtomicU64::new(0),
@@ -206,10 +235,11 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Server::http(&args.bind).map_err(|e| format!("failed to bind {}: {e}", args.bind))?;
 
     eprintln!(
-        "primd serve | listening on http://{} | corpus={} embedder={:?}",
+        "primd serve | listening on http://{} | corpus={} embedder={:?} predictor={:?}",
         args.bind,
         state.index.len(),
-        state.manifest.embedder
+        state.manifest.embedder,
+        state.predictor_kind,
     );
     eprintln!(
         "endpoints: POST /query | POST /v1/chat/completions | GET /health | GET /stats | POST /session/{{id}}/observe | POST /session/{{id}}/finalize | POST /session/{{id}}/warm | POST /session/{{id}}/reset"

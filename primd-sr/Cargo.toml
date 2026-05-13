@@ -1,0 +1,18 @@
+[package]
+name = "primd-sr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Successor Representation predictor for primd's predictive turn-cache"
+keywords = ["voice-ai", "rag", "successor-representation", "predictor", "primd"]
+categories = ["algorithms", "science"]
+readme = "../README.md"
+
+[dependencies]
+primd-core = { path = "../primd-core", version = "0.1" }
+serde.workspace = true
+serde_json.workspace = true

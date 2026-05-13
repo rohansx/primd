@@ -159,6 +159,7 @@ Per-layer docs:
 - [Layer 1 — streaming partials](docs/architecture/layer-1-streaming.md)
 - [Layer 2 — binary signature index](docs/architecture/layer-2-index.md)
 - [Layer 3 — Markov predictor + prefetch](docs/architecture/layer-3-prediction.md)
+- [Layer 3 (v0.2) — Successor Representation predictor](docs/architecture/successor-representation.md)
 - [Layer 4 — predictive coding delta cache](docs/architecture/layer-4-coding.md)
 - [Overview](docs/architecture/overview.md)
 
@@ -174,12 +175,14 @@ Shipping:
 - `pipecat-primd` Python package (`FrameProcessor` + async client)
 - Voice-realistic benchmark harness
 
-Roadmap (v0.2):
+Roadmap (v0.2 — in progress):
 
-- `NextTurnPredictor` trait + **Successor Representation predictor** (replaces variable-order Markov with TD(0)-trained low-rank SR; hippocampal predictive map literature)
-- **MoshiRAG back-end adapter** — OpenAI-compatible `/v1/chat/completions` endpoint so MoshiRAG can swap its 3 s vLLM call for primd's sub-200 µs response with one env var change
+- ✅ `NextTurnPredictor` trait (foundation for swappable predictors)
+- ✅ **MoshiRAG back-end adapter** — OpenAI-compatible `/v1/chat/completions` endpoint so MoshiRAG can swap its 3 s vLLM call for primd's sub-200 µs response with one env var change
+- ✅ **Successor Representation predictor** in new `primd-sr` crate (tabular variant + Hybrid SR+Markov wrapper). Enable with `primd serve --predictor hybrid`.
 - **Real per-event HNSW shards** (currently the event-scoped path is a SIMD gather + subset rescan, not HNSW; see [roadmap](docs/plan/roadmap.md))
-- Public benchmark vs Moss + Qdrant + Pinecone at the *finalize* event, not at `/query`
+- Public benchmark vs Moss + Qdrant + Pinecone at the *finalize* event
+- A/B harness measuring SR vs Markov speculative-cache hit-rate lift
 
 Roadmap (v0.3):
 

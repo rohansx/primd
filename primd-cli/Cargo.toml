@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 primd-core = { path = "../primd-core", version = "0.1.0", features = ["openai", "local"] }
+primd-sr = { path = "../primd-sr", version = "0.1.0" }
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1962,6 +1962,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "primd-core",
+ "primd-sr",
  "serde",
  "serde_json",
  "tiny_http",
@@ -1980,6 +1981,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "ureq",
+]
+
+[[package]]
+name = "primd-sr"
+version = "0.1.0"
+dependencies = [
+ "primd-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

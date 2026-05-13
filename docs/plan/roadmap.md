@@ -16,24 +16,27 @@ The shape of the work is now: **defend the wedge** (turn-cache positioning, real
 - Hashed / OpenAI / fastembed local embedders
 - crates.io-publish-ready (`primd-core`, `primd-cli`)
 
-## v0.2 — Turn-cache moat (Q3 2026)
+## v0.2 — Turn-cache moat (Q3 2026, in progress)
 
 The headline release: ship the technical artifacts that make the "predictive turn-cache" positioning provable and unique.
 
 ### Track A — Predictor refactor & Successor Representation
 
-1. **`NextTurnPredictor` trait** *(week 1, foundational)* — pull `MarkovPredictor` behind a trait so SR can slot in without an API break. Trait surface: `predict(ctx) -> Vec<(EventId, f32)>`, `observe(prev, next)`, `confidence() -> f32`.
-2. **`primd-sr` crate** *(weeks 2–7, headline)* — Successor Representation predictor:
-   - TD(0) update: `M[s_t, :] += η · (φ(s_{t+1}) + γ · M[s_{t+1}, :] − M[s_t, :])`
-   - Low-rank reduction: `W: 256×K, M_low: K×K` with K=32 (matches a cache line × 4 SIMD lanes of f64)
-   - Confidence signal: spectral gap of `M_low`
-   - Hybrid wrapper: SR + Markov fallback gated on `sr.confidence() > τ` (default τ = 0.05)
-   - Cold-start: pre-trained generic SR on synthetic FAQ + tool-use corpus, ~50 KB embedded
-   - Online: TD(0) with η_t = 0.1 / (1 + 0.01 · t)
-   - Persistence: session-local `.primd-sr` artifact for cross-session warm-start
-3. **A/B harness** *(week 8)* — 1000-conversation eval corpus, measure speculative-cache hit rate of Hybrid vs pure Markov. Target: ≥ 15 % absolute lift on conversations with ≥ 5 turns.
+1. ✅ **`NextTurnPredictor` trait** (2026-05-13) — `MarkovPredictor` lives behind the trait, `QueryContext` holds `Box<dyn NextTurnPredictor>`.
+2. ✅ **`primd-sr` crate, tabular variant** (2026-05-13) — Successor Representation predictor:
+   - TD(0) update: `M[s_t, :] += η · (e_{s_t} + γ · M[s_{t+1}, :] − M[s_t, :])`
+   - Self-visit initialization `M[s, s] = 1.0` on first sight so bootstrap is correct from the first observation
+   - Sparse `HashMap<EventId, HashMap<EventId, f32>>` storage; correct for tens-to-hundreds of events
+   - Confidence: linear warmth `min(1, t / warmup)`
+   - Hybrid wrapper: SR + Markov; threshold 0.5 by default
+   - Online TD(0) with η_t = η_base / (1 + 0.01 · t)
+   - JSON persistence (`save_to_file` / `load_from_file`)
+   - CLI flag: `primd serve --predictor {markov,sr,hybrid}` (default `markov` for v0.2 stability)
+3. **Low-rank reduction** *(v0.2.5)* — `W: 256×32`, `M_low: 32×32` with spectral-gap confidence and portable-SIMD TD updates. Trait surface stays the same; low-rank slots in as a third impl.
+4. **A/B harness** *(v0.2.5)* — 1000-conversation eval corpus, measure speculative-cache hit rate of Hybrid vs pure Markov. Target: ≥ 15 % absolute lift on conversations with ≥ 5 turns.
+5. **Per-user persistence** *(v0.2.5)* — `SrPredictor` artifact keyed by `user_id` from the OpenAI `user` field; warm-starts returning users.
 
-References: Dayan 1993, Stachenfeld et al. 2017 (Nat Neurosci 20:1643–1653), Russek et al. 2017 (Nat Hum Behav 1:680–692), Gershman 2018 (J Neurosci 38:7193).
+References: Dayan 1993, Stachenfeld et al. 2017 (Nat Neurosci 20:1643–1653), Russek et al. 2017 (Nat Hum Behav 1:680–692), Gershman 2018 (J Neurosci 38:7193). See [successor-representation.md](../architecture/successor-representation.md).
 
 ### Track B — Real per-event HNSW shards
 
@@ -41,7 +44,7 @@ The current event-scoped path is a SIMD gather + subset rescan, not HNSW. Works 
 
 ### Track C — MoshiRAG back-end adapter
 
-OpenAI-compatible `/v1/chat/completions` endpoint on `primd serve` so MoshiRAG (and any other tool expecting an OpenAI-compatible retrieval back-end) can swap its 1–3 s vLLM call for primd's sub-200 µs response with one env-var change. Returns retrieved context as the completion string; the model in the loop still generates.
+✅ Shipped 2026-05-13. OpenAI-compatible `/v1/chat/completions` endpoint on `primd serve` lets MoshiRAG (and any other tool expecting an OpenAI-compatible retrieval back-end) swap its 1–3 s vLLM call for primd's sub-200 µs response with one env-var change. Returns retrieved context as the completion string; the model in the loop still generates. See [docs/integrations/moshirag.md](../integrations/moshirag.md).
 
 ### Track D — Public benchmark vs Moss + Qdrant + Pinecone
 
