@@ -22,9 +22,13 @@
 //!   DWM-backed store and remain queryable across multi-day sessions.
 
 pub mod bitvec;
+pub mod cold_tier;
 pub mod random_indexing;
+pub mod signature_dwm;
 
 pub use bitvec::BitVector;
+pub use cold_tier::{ColdTier, DwmColdTier};
 pub use random_indexing::{
     DEFAULT_D, DEFAULT_SEED as DEFAULT_RI_SEED, DEFAULT_T, RandomIndexer,
 };
+pub use signature_dwm::SignatureDwm;

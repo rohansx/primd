@@ -118,10 +118,11 @@ Refactor `observe_partial` so it works without discrete STT partial frames — a
 - `BitVector` with O(1) `rank_1` / `select_1` primitives via two-level lookup tables (Jacobson 1989 + Clark 1996 succinct data-structures construction). ~6.25 % auxiliary overhead. Serializable for cold-tier persistence.
 - `RandomIndexer` for zero-LLM-token signature construction per the Hippocampus paper (Appendix B). Sparse ternary base vectors + sliding-window aggregation + top-K sign-quantization → 256-bit signatures compatible with primd-core's existing pipeline.
 
-**v0.4 work to complete the cold tier:**
-- `SignatureDWM` — wavelet-matrix-backed cold-tier store layering many `BitVector`s. Append-only; supports compressed-domain Hamming-ball queries via XOR + popcount over the layered structure.
-- Integration with `QueryContext` — events evicted from hot tier (HNSW shards) move into the DWM-backed store keyed by `session_id`. Cross-session memory for multi-day voice agents.
-- Public LoCoMo / LongMemEval bench to credentialize the long-horizon recall story without competing with Hippocampus on its home turf.
+**v0.4 progress (2026-05-14):**
+- ✅ `SignatureDwm` — 256-layer bit-vector store with lossless retrieval, hamming-distance queries, batched-append tail with auto-compaction, and JSON serde persistence. v0.4 ships the linear-scan query path (already as fast as primd-core's SIMD scan on cold-tier query volumes); v0.4.1 plans the paper's rank/select-accelerated compressed-domain variant once a real bench justifies it.
+- ✅ `ColdTier` trait + `DwmColdTier` impl — pluggable cold-storage interface. Encodes `(EventId, doc_idx)` into the DWM's `u64` value slot via a simple bit-pack. Trait-object-safe so future cold tiers (e.g. a remote/blob-store backend) drop in.
+- ❌ **QueryContext integration** — wire the cold tier into `QueryContext` so hot-tier eviction (when an event hasn't been touched for N turns) automatically flows into cold storage, and cold-tier results merge with hot results when the hot tier returns sparse hits. v0.4.1.
+- ❌ **Public LoCoMo / LongMemEval bench** to credentialize the long-horizon recall story without competing with Hippocampus on its home turf.
 
 First-mover status: the paper (arXiv:2602.13594) had no public reference code as of May 2026. The foundation we shipped today is the first open-source port of any portion of the algorithm. Strategy memo flagged this as time-sensitive; if MLSys accepts and the authors release reference code in June–August 2026, our framing pivots from "first-mover" to "Rust-idiomatic implementation" but the work still has reference value.
 
