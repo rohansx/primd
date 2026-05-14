@@ -93,17 +93,6 @@ impl Default for DwmColdTier {
     }
 }
 
-impl DwmColdTier {
-    /// Persist the cold tier to disk. `ColdTier` keeps its trait surface
-    /// minimal; persistence is an impl-specific helper on `DwmColdTier`
-    /// directly.
-    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, bytes)
-    }
-}
-
 impl ColdTier for DwmColdTier {
     fn len(&self) -> usize {
         self.dwm.len()
@@ -125,6 +114,12 @@ impl ColdTier for DwmColdTier {
                 (d, event, doc_idx)
             })
             .collect()
+    }
+
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, bytes)
     }
 }
 

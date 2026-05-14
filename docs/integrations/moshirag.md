@@ -122,6 +122,20 @@ The same `user` field that OpenAI uses for client identification becomes primd's
 
 Pass `--sr-state-dir <path>` to `primd serve` to persist each session's Markov predictor across restarts. On session `reset`, the current Markov state is written to `<path>/<sanitized-user>.markov.json`. On the next session create with the same `user` (or session id), primd warm-starts from that file instead of cold-starting.
 
+## Cold-tier session memory (v0.4)
+
+`--cold-tier-dir <path>` attaches a per-session DWM-backed cold tier to every voice session. Evicted signatures (from previous sessions or from out-of-band batch processing) live in `<path>/<sanitized-user>.cold.json` and load automatically when the session starts. Cold-tier hits surface in the `cold_hits` field of every finalize response — useful for spanning context across multi-day conversations without keeping the entire hot-path corpus warm.
+
+```bash
+./target/release/primd serve \
+  --index /tmp/primd-faq \
+  --predictor hybrid \
+  --sr-state-dir /var/lib/primd/sessions \
+  --cold-tier-dir /var/lib/primd/cold
+```
+
+Cold-tier results are independent of and additive to hot-tier hits — both are returned in the same response so the caller can merge or filter as appropriate. See [the architecture overview](../architecture/overview.md) for the layered design and `docs/plan/roadmap.md` Track F for the Hippocampus DWM context.
+
 ```bash
 ./target/release/primd serve \
   --index /tmp/primd-faq \

@@ -89,6 +89,13 @@ impl QueryContext {
         self.cold_tier.is_some()
     }
 
+    /// Borrow the attached cold tier, if any. Lets a session-manager
+    /// (e.g. `primd serve`'s reset handler) persist the tier via its
+    /// trait `save` method without needing to downcast the box.
+    pub fn cold_tier(&self) -> Option<&dyn ColdTier> {
+        self.cold_tier.as_deref()
+    }
+
     pub fn with_search_options(mut self, options: SearchOptions) -> Self {
         self.search_options = options;
         self
@@ -376,6 +383,10 @@ mod tests {
             } else {
                 vec![self.canned_hit]
             }
+        }
+        fn save(&self, _path: &std::path::Path) -> std::io::Result<()> {
+            // Stub — tests don't exercise persistence.
+            Ok(())
         }
     }
 

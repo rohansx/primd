@@ -44,4 +44,10 @@ pub trait ColdTier: Send + Sync {
     /// `query`. Returns `(distance, event_id, doc_idx)` triples sorted
     /// by ascending distance.
     fn search(&self, query: &BinarySignature, top_k: usize) -> Vec<(u32, EventId, usize)>;
+
+    /// Persist the cold tier to `path`. Format is impl-specific —
+    /// `DwmColdTier` writes JSON; other impls (e.g. a remote blob
+    /// store) might write a manifest pointing at object storage.
+    /// Returns errors via `std::io::Error` for filesystem failures.
+    fn save(&self, path: &std::path::Path) -> std::io::Result<()>;
 }

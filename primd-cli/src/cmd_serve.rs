@@ -12,9 +12,10 @@ use primd_core::embed::{
     EmbeddingPipeline, HashedEmbedder, LocalEmbedder, OpenAIEmbedder, random_projection,
 };
 use primd_core::{
-    BinarySignature, EventCatalog, HierarchicalIndex, MarkovPredictor, PrimdError, QueryContext,
-    QueryOutput, SearchOptions, ServedBy, SignatureIndex,
+    BinarySignature, ColdTier, EventCatalog, HierarchicalIndex, MarkovPredictor, PrimdError,
+    QueryContext, QueryOutput, SearchOptions, ServedBy, SignatureIndex,
 };
+use primd_dwm::DwmColdTier;
 use primd_sr::{HybridPredictor, SrPredictor};
 
 use crate::cmd_index::{EmbedderKind, LocalModelKind};
@@ -44,6 +45,20 @@ pub struct ServeArgs {
     /// `/session/{id}/reset` is called or when `primd serve` restarts.
     #[arg(long)]
     pub sr_state_dir: Option<PathBuf>,
+
+    /// Directory for per-session **cold-tier** persistence. When set,
+    /// each session attaches a DWM-backed cold tier loaded from
+    /// `<dir>/<session_id>.cold.json` on create and saved back on
+    /// reset. The cold tier supplements hot-tier hits at every
+    /// `/finalize` and `/v1/chat/completions` call with results that
+    /// came from previously-evicted events (v0.4 Hippocampus DWM
+    /// cold tier).
+    ///
+    /// Independent of `--sr-state-dir`; they serve different purposes
+    /// (Markov predictor state vs evicted-signature memory) and can
+    /// be configured separately.
+    #[arg(long)]
+    pub cold_tier_dir: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -111,6 +126,21 @@ struct QueryResponse {
     served_by: &'static str,
     predicted_events: Vec<String>,
     shard_scope_size: usize,
+    /// Hits supplied by the cold tier (DWM-backed), if attached.
+    /// Empty when no cold tier is configured or it returns no results.
+    /// Each entry includes the event name + doc index for caller-side
+    /// lookup; the doc index is from the cold tier's value-encoding
+    /// at eviction time, not the live signature index.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cold_hits: Vec<ColdHit>,
+}
+
+#[derive(Serialize)]
+struct ColdHit {
+    rank: usize,
+    distance: u32,
+    event: String,
+    doc_idx: usize,
 }
 
 #[derive(Serialize)]
@@ -158,6 +188,9 @@ struct State {
     /// Per-session Markov state directory. When set, sessions persist
     /// here on `reset` and warm-start on create.
     sr_state_dir: Option<PathBuf>,
+    /// Per-session cold-tier directory. When set, sessions attach a
+    /// DWM-backed cold tier loaded from disk on create.
+    cold_tier_dir: Option<PathBuf>,
     predictor_kind: PredictorKind,
     sessions: Mutex<HashMap<String, QueryContext>>,
     queries_served: AtomicU64,
@@ -222,7 +255,7 @@ impl State {
     }
 
     fn new_session(&self, session_id: &str) -> QueryContext {
-        match self.predictor_kind {
+        let mut ctx = match self.predictor_kind {
             PredictorKind::Markov => {
                 QueryContext::with_predictor(self.load_markov_for_session(session_id))
             }
@@ -231,6 +264,38 @@ impl State {
                 SrPredictor::new(),
                 self.load_markov_for_session(session_id),
             )),
+        };
+        if let Some(cold) = self.load_cold_tier_for_session(session_id) {
+            ctx = ctx.with_cold_tier(cold);
+        }
+        ctx
+    }
+
+    /// Path to a session's persisted cold tier (DWM-backed). `None`
+    /// when `--cold-tier-dir` was not set.
+    fn session_cold_path(&self, session_id: &str) -> Option<PathBuf> {
+        self.cold_tier_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.cold.json", sanitize_session_id(session_id))))
+    }
+
+    /// Load a session's persisted cold tier (DWM-backed). Returns the
+    /// boxed trait object so `QueryContext::with_cold_tier` can accept
+    /// it. Falls back to an empty cold tier when the file doesn't
+    /// exist yet — first-time sessions start empty rather than
+    /// declining to attach.
+    fn load_cold_tier_for_session(&self, session_id: &str) -> Option<Box<dyn ColdTier>> {
+        let path = self.session_cold_path(session_id)?;
+        if path.exists() {
+            match DwmColdTier::load(&path) {
+                Ok(cold) => Some(Box::new(cold) as Box<dyn ColdTier>),
+                Err(e) => {
+                    eprintln!("warning: failed to load cold tier from {path:?}: {e}");
+                    Some(Box::new(DwmColdTier::empty()) as Box<dyn ColdTier>)
+                }
+            }
+        } else {
+            Some(Box::new(DwmColdTier::empty()) as Box<dyn ColdTier>)
         }
     }
 }
@@ -294,6 +359,12 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     {
         eprintln!("warning: could not create --sr-state-dir {dir:?}: {e}");
     }
+    if let Some(dir) = &args.cold_tier_dir
+        && !dir.exists()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("warning: could not create --cold-tier-dir {dir:?}: {e}");
+    }
 
     let state = Arc::new(State {
         manifest,
@@ -304,6 +375,7 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         pipeline,
         predictor_path: transitions_path.exists().then_some(transitions_path),
         sr_state_dir: args.sr_state_dir,
+        cold_tier_dir: args.cold_tier_dir,
         predictor_kind: args.predictor,
         sessions: Mutex::new(HashMap::new()),
         queries_served: AtomicU64::new(0),
@@ -412,6 +484,9 @@ fn handle_query(state: &State, body: &str) -> Result<Response<std::io::Cursor<Ve
             .filter_map(|event| state.event_name_for_id.get(&event.0).cloned())
             .collect(),
         shard_scope_size: search.shard_scope_size,
+        // Stateless /query path doesn't have a session and therefore
+        // doesn't carry a cold tier; this field is always empty here.
+        cold_hits: Vec::new(),
     };
     Ok(json_response(
         200,
@@ -498,10 +573,21 @@ fn handle_session(
         }
         "reset" => {
             let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
-            if let Some(ctx) = sessions.remove(&session_id)
-                && let Some(markov) = ctx.predictor().as_markov()
-            {
-                state.persist_session_markov(&session_id, markov);
+            if let Some(ctx) = sessions.remove(&session_id) {
+                if let Some(markov) = ctx.predictor().as_markov() {
+                    state.persist_session_markov(&session_id, markov);
+                }
+                if let (Some(cold), Some(path)) =
+                    (ctx.cold_tier(), state.session_cold_path(&session_id))
+                {
+                    if let Some(parent) = path.parent()
+                        && let Err(e) = std::fs::create_dir_all(parent)
+                    {
+                        eprintln!("warning: could not create cold_tier_dir parent {parent:?}: {e}");
+                    } else if let Err(e) = cold.save(&path) {
+                        eprintln!("warning: failed to persist cold tier to {path:?}: {e}");
+                    }
+                }
             }
             Ok(json_response(200, "{\"status\":\"reset\"}"))
         }
@@ -516,6 +602,21 @@ fn session_query_response(
     embed_us: u128,
     scan_us: u128,
 ) -> QueryResponse {
+    let cold_hits = out
+        .cold_results
+        .iter()
+        .enumerate()
+        .map(|(i, &(distance, event, doc_idx))| ColdHit {
+            rank: i + 1,
+            distance,
+            event: state
+                .event_name_for_id
+                .get(&event.0)
+                .cloned()
+                .unwrap_or_else(|| format!("event_{}", event.0)),
+            doc_idx,
+        })
+        .collect();
     QueryResponse {
         embedder: state.manifest.embedder,
         embed_us,
@@ -529,6 +630,7 @@ fn session_query_response(
             .filter_map(|event| state.event_name_for_id.get(&event.0).cloned())
             .collect(),
         shard_scope_size: out.shard_scope_size,
+        cold_hits,
     }
 }
 
