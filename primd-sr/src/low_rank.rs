@@ -197,6 +197,37 @@ impl<const K: usize> LowRankSrPredictor<K> {
         Self::finalize_construction(event_centroids, projection, mean, init, true)
     }
 
+    /// v0.2.8: PCA projection trained over the **full document corpus**,
+    /// not just event centroids. Closes the paraphrase_ab regression
+    /// where centroid-PCA over-compressed within-topic variance.
+    ///
+    /// `corpus_signatures` should be every doc's signature (e.g., the
+    /// full `SignatureIndex::as_slice()` contents). With N >> 256, the
+    /// covariance matrix is well-conditioned and the top-K eigenvectors
+    /// capture both between-cluster *and* within-cluster axes — the
+    /// information centroid-PCA was discarding.
+    pub fn with_pca_over_corpus(
+        event_centroids: &HashMap<EventId, BinarySignature>,
+        corpus_signatures: &[BinarySignature],
+    ) -> Self {
+        Self::with_pca_over_corpus_and_init(
+            event_centroids,
+            corpus_signatures,
+            MLowInit::default(),
+        )
+    }
+
+    /// PCA-over-corpus constructor exposing the `M_low` init.
+    pub fn with_pca_over_corpus_and_init(
+        event_centroids: &HashMap<EventId, BinarySignature>,
+        corpus_signatures: &[BinarySignature],
+        init: MLowInit,
+    ) -> Self {
+        let (projection, mean_arr) = crate::pca::compute_pca::<K>(corpus_signatures);
+        let mean: Box<[f32; SIG_BITS]> = Box::new(mean_arr);
+        Self::finalize_construction(event_centroids, projection, mean, init, true)
+    }
+
     /// Internal shared finalization step — builds `m_low`, projects every
     /// event's centroid into feature space, and assembles the struct.
     fn finalize_construction(

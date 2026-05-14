@@ -465,6 +465,30 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
                 .with_gamma(0.9),
         ),
     );
+    // v0.2.8: PCA trained over the full doc corpus instead of just
+    // event centroids. Tests the hypothesis that within-topic variation
+    // in the training data closes the chance-level regression.
+    let corpus_sigs: Vec<BinarySignature> = index.signatures().as_slice().to_vec();
+    let r_lr32_pca_corpus = run_session(
+        "low-rank-K32-PCA-corpus",
+        &index,
+        &workload,
+        Box::new(
+            LowRankSrPredictor::<32>::with_pca_over_corpus(&centroids, &corpus_sigs)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
+    );
+    let r_lr64_pca_corpus = run_session(
+        "low-rank-K64-PCA-corpus",
+        &index,
+        &workload,
+        Box::new(
+            LowRankSrPredictor::<64>::with_pca_over_corpus(&centroids, &corpus_sigs)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
+    );
     let r_hybrid = run_session(
         "hybrid-LR(0.5)",
         &index,
@@ -491,6 +515,8 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
         &r_lr128,
         &r_lr32_pca,
         &r_lr64_pca,
+        &r_lr32_pca_corpus,
+        &r_lr64_pca_corpus,
         &r_hybrid,
     ] {
         print!("{}", r.report());
@@ -498,14 +524,22 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
 
     println!();
     println!("Top-1 topic correctness — the bench's primary content-quality metric:");
-    println!("  markov:            {:.1}%", r_markov.top1_pct());
-    println!("  sr-tabular:        {:.1}%", r_sr_tab.top1_pct());
-    println!("  low-rank-K32:      {:.1}%", r_lr32.top1_pct());
-    println!("  low-rank-K64:      {:.1}%", r_lr64.top1_pct());
-    println!("  low-rank-K128:     {:.1}%", r_lr128.top1_pct());
-    println!("  low-rank-K32-PCA:  {:.1}%", r_lr32_pca.top1_pct());
-    println!("  low-rank-K64-PCA:  {:.1}%", r_lr64_pca.top1_pct());
-    println!("  hybrid-LR:         {:.1}%", r_hybrid.top1_pct());
+    println!("  markov:                  {:.1}%", r_markov.top1_pct());
+    println!("  sr-tabular:              {:.1}%", r_sr_tab.top1_pct());
+    println!("  low-rank-K32:            {:.1}%", r_lr32.top1_pct());
+    println!("  low-rank-K64:            {:.1}%", r_lr64.top1_pct());
+    println!("  low-rank-K128:           {:.1}%", r_lr128.top1_pct());
+    println!("  low-rank-K32-PCA:        {:.1}%", r_lr32_pca.top1_pct());
+    println!("  low-rank-K64-PCA:        {:.1}%", r_lr64_pca.top1_pct());
+    println!(
+        "  low-rank-K32-PCA-corpus: {:.1}%  ← v0.2.8 PCA over docs",
+        r_lr32_pca_corpus.top1_pct()
+    );
+    println!(
+        "  low-rank-K64-PCA-corpus: {:.1}%",
+        r_lr64_pca_corpus.top1_pct()
+    );
+    println!("  hybrid-LR:               {:.1}%", r_hybrid.top1_pct());
 
     let markov_pct = r_markov.top1_pct();
 
