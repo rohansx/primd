@@ -35,7 +35,7 @@ The headline release: ship the technical artifacts that make the "predictive tur
 3. ✅ **Low-rank reduction** (2026-05-14) — `W: 256×32` random projection over signature bits; `M_low: 32×32` updated by TD(0). New `LowRankSrPredictor` in `primd-sr/src/low_rank.rs`. Identity initialization for correct bootstrap. 7 unit tests; integrated into the A/B bench.
 4. ✅ **A/B harness** (2026-05-14) — `predictor_ab` bench measures Markov / SR-tabular / low-rank-SR / Hybrid side-by-side at 1000 utterances with windowed cumulative hit-rates. Validates Hybrid robustness (0 pp regression vs Markov).
 5. ✅ **Paraphrase-aware adversarial workload** (2026-05-14) — `paraphrase_ab` bench, 10 topics × 10 paraphrases, with top-1 / top-K topic-correctness metrics. **Negative result:** low-rank SR underperforms Markov by 58.8 pp on top-1 topic correctness. The K=32 random projection over-pools and the M_low=I initialization biases toward current-feature-aligned (within-topic) prediction. See [bench-report.md § paraphrase_ab](../benchmarks/bench-report.md#paraphrase_ab-results) for the full analysis.
-6. **Per-user persistence** *(v0.2.5)* — `SrPredictor` artifact keyed by `user_id` from the OpenAI `user` field; warm-starts returning users.
+6. ✅ **Per-user predictor persistence** (2026-05-14) — `primd serve --sr-state-dir <path>` writes each session's Markov state on reset and warm-starts from disk on session create. New `NextTurnPredictor::as_markov()` trait method (default `None`; MarkovPredictor + HybridPredictor override). Session-id sanitization neutralizes path-traversal attempts. Works for `--predictor markov` and `--predictor hybrid`; full SR-state persistence is v0.2.7 work.
 
 ### v0.2.6 — iterate low-rank SR against the paraphrase bench
 

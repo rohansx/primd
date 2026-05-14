@@ -313,6 +313,10 @@ impl NextTurnPredictor for MarkovPredictor {
     fn observe(&mut self, prev: EventId, next: EventId) {
         MarkovPredictor::observe(self, prev, next)
     }
+
+    fn as_markov(&self) -> Option<&MarkovPredictor> {
+        Some(self)
+    }
 }
 
 #[cfg(test)]

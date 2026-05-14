@@ -322,6 +322,10 @@ impl NextTurnPredictor for HybridPredictor {
     fn confidence(&self) -> f32 {
         self.sr.confidence().max(self.markov.confidence())
     }
+
+    fn as_markov(&self) -> Option<&MarkovPredictor> {
+        Some(&self.markov)
+    }
 }
 
 // ---------------------------------------------------------------------------

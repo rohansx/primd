@@ -118,6 +118,21 @@ The same `user` field that OpenAI uses for client identification becomes primd's
 - **primd doesn't generate.** The `assistant` message's `content` is retrieved context. If your client expects natural-language answers, run the response through an LLM in your pipeline (which is how MoshiRAG works — the audio model consumes the retrieved context).
 - **Indexes built before v0.2 don't carry doc texts.** Older `manifest.json` files lack the `texts` field; the adapter falls back to returning doc IDs in place of body text. Re-index to get full content.
 
+## Per-user predictor persistence
+
+Pass `--sr-state-dir <path>` to `primd serve` to persist each session's Markov predictor across restarts. On session `reset`, the current Markov state is written to `<path>/<sanitized-user>.markov.json`. On the next session create with the same `user` (or session id), primd warm-starts from that file instead of cold-starting.
+
+```bash
+./target/release/primd serve \
+  --index /tmp/primd-faq \
+  --predictor hybrid \
+  --sr-state-dir /var/lib/primd/sessions
+```
+
+Works for `--predictor markov` and `--predictor hybrid` (which carries a Markov fallback inside). Pure SR / low-rank predictors return `None` from the new `NextTurnPredictor::as_markov()` trait method and skip persistence — full SR-state persistence lands in v0.2.7.
+
+User-ids are sanitized to alphanumeric + `. _ -` before being used as filenames, so `user="../../etc/passwd"` writes safely to `.._.._etc_passwd.markov.json` inside the configured directory and cannot escape it.
+
 ## Drop-in for MoshiRAG
 
 MoshiRAG configures its retrieval back-end via an OpenAI-compatible base URL. The swap is:

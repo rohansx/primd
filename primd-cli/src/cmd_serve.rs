@@ -33,6 +33,17 @@ pub struct ServeArgs {
     ///   `hybrid` — SR + Markov; Markov serves cold-start, SR takes over once warm
     #[arg(long, value_enum, default_value_t = PredictorKind::Markov)]
     pub predictor: PredictorKind,
+
+    /// Directory for per-session predictor persistence. When set, each
+    /// session's Markov state (also serving as the Hybrid wrapper's
+    /// fallback predictor) is persisted to `<dir>/<session_id>.markov.json`
+    /// on session reset, and loaded on session create. Returning users
+    /// with stable `user`/session ids start warm instead of cold.
+    ///
+    /// If unset (default), sessions are in-memory only and lost when
+    /// `/session/{id}/reset` is called or when `primd serve` restarts.
+    #[arg(long)]
+    pub sr_state_dir: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
@@ -140,7 +151,13 @@ struct State {
     /// when this is empty.
     text_for_id: HashMap<String, String>,
     pipeline: Box<dyn QueryEmbedder>,
+    /// Shared Markov seed at index time (`<index>/transitions.json`).
+    /// Used as a fallback when no per-session state exists at
+    /// [`Self::sr_state_dir`].
     predictor_path: Option<PathBuf>,
+    /// Per-session Markov state directory. When set, sessions persist
+    /// here on `reset` and warm-start on create.
+    sr_state_dir: Option<PathBuf>,
     predictor_kind: PredictorKind,
     sessions: Mutex<HashMap<String, QueryContext>>,
     queries_served: AtomicU64,
@@ -158,24 +175,79 @@ impl State {
     }
 
     /// Load the persisted Markov state if a `transitions.json` was found at
-    /// index-time. Used for both `markov` and `hybrid` predictor kinds.
-    fn load_markov(&self) -> MarkovPredictor {
+    /// index-time. The shared corpus-level prior; per-session state takes
+    /// precedence when present (see [`Self::session_markov_path`]).
+    fn load_markov_shared(&self) -> MarkovPredictor {
         self.predictor_path
             .as_ref()
             .and_then(|path| MarkovPredictor::load_from_file(path).ok())
             .unwrap_or_default()
     }
 
-    fn new_session(&self) -> QueryContext {
+    /// Path to a session's persisted Markov state. None when
+    /// `--sr-state-dir` was not set.
+    fn session_markov_path(&self, session_id: &str) -> Option<PathBuf> {
+        self.sr_state_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.markov.json", sanitize_session_id(session_id))))
+    }
+
+    /// Resolve the right Markov predictor for a given session: per-session
+    /// state if it exists, otherwise the shared corpus-level prior.
+    fn load_markov_for_session(&self, session_id: &str) -> MarkovPredictor {
+        if let Some(path) = self.session_markov_path(session_id)
+            && let Ok(persisted) = MarkovPredictor::load_from_file(&path)
+        {
+            return persisted;
+        }
+        self.load_markov_shared()
+    }
+
+    /// Persist a session's Markov state to disk, if `--sr-state-dir` is
+    /// configured. Best-effort — logs warnings on I/O errors but does not
+    /// fail the session reset that triggered the save.
+    fn persist_session_markov(&self, session_id: &str, markov: &MarkovPredictor) {
+        let Some(path) = self.session_markov_path(session_id) else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            eprintln!("warning: could not create sr_state_dir parent {parent:?}: {e}");
+            return;
+        }
+        if let Err(e) = markov.save_to_file(&path) {
+            eprintln!("warning: failed to persist session markov to {path:?}: {e}");
+        }
+    }
+
+    fn new_session(&self, session_id: &str) -> QueryContext {
         match self.predictor_kind {
-            PredictorKind::Markov => QueryContext::with_predictor(self.load_markov()),
+            PredictorKind::Markov => {
+                QueryContext::with_predictor(self.load_markov_for_session(session_id))
+            }
             PredictorKind::Sr => QueryContext::with_predictor(SrPredictor::new()),
             PredictorKind::Hybrid => QueryContext::with_predictor(HybridPredictor::new(
                 SrPredictor::new(),
-                self.load_markov(),
+                self.load_markov_for_session(session_id),
             )),
         }
     }
+}
+
+/// Strip path-traversal characters from a session id so an attacker
+/// cannot pivot from the `user` field into the filesystem. Keep
+/// alphanumeric + `-` + `_` + `.`; replace everything else with `_`.
+fn sanitize_session_id(id: &str) -> String {
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -216,6 +288,13 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("loading embedder {:?}…", manifest.embedder);
     let pipeline = build_pipeline(&manifest)?;
 
+    if let Some(dir) = &args.sr_state_dir
+        && !dir.exists()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!("warning: could not create --sr-state-dir {dir:?}: {e}");
+    }
+
     let state = Arc::new(State {
         manifest,
         index,
@@ -224,6 +303,7 @@ pub fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         text_for_id,
         pipeline,
         predictor_path: transitions_path.exists().then_some(transitions_path),
+        sr_state_dir: args.sr_state_dir,
         predictor_kind: args.predictor,
         sessions: Mutex::new(HashMap::new()),
         queries_served: AtomicU64::new(0),
@@ -361,8 +441,8 @@ fn handle_session(
                 .map_err(|e| e.to_string())?;
             let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
             let session = sessions
-                .entry(session_id)
-                .or_insert_with(|| state.new_session());
+                .entry(session_id.clone())
+                .or_insert_with(|| state.new_session(&session_id));
             session.observe_partial(&state.index, sig, req.top_k);
             Ok(json_response(200, "{\"status\":\"ok\"}"))
         }
@@ -378,8 +458,8 @@ fn handle_session(
             let scan_start = Instant::now();
             let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
             let session = sessions
-                .entry(session_id)
-                .or_insert_with(|| state.new_session());
+                .entry(session_id.clone())
+                .or_insert_with(|| state.new_session(&session_id));
             let out = session.finalize(&state.index, sig, req.top_k);
             let scan_elapsed = scan_start.elapsed();
             state.record_latency(embed_elapsed.as_nanos(), scan_elapsed.as_nanos());
@@ -401,8 +481,8 @@ fn handle_session(
                     .map_err(|e| format!("bad json: {e}"))?;
             let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
             let session = sessions
-                .entry(session_id)
-                .or_insert_with(|| state.new_session());
+                .entry(session_id.clone())
+                .or_insert_with(|| state.new_session(&session_id));
             let predicted = session.warm_next(&state.index);
             let response = SessionWarmResponse {
                 predicted_events: predicted
@@ -418,7 +498,11 @@ fn handle_session(
         }
         "reset" => {
             let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
-            sessions.remove(&session_id);
+            if let Some(ctx) = sessions.remove(&session_id)
+                && let Some(markov) = ctx.predictor().as_markov()
+            {
+                state.persist_session_markov(&session_id, markov);
+            }
             Ok(json_response(200, "{\"status\":\"reset\"}"))
         }
         _ => Err("unknown session action".into()),
@@ -690,7 +774,7 @@ fn handle_chat_completions(
         let mut sessions = state.sessions.lock().map_err(|_| "session lock poisoned")?;
         let session = sessions
             .entry(session_id.to_string())
-            .or_insert_with(|| state.new_session());
+            .or_insert_with(|| state.new_session(session_id));
         let out = session.finalize(&state.index, sig, top_k);
         let hits = map_hits(state, out.results);
         let predicted = out
@@ -767,6 +851,21 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
         }
+    }
+
+    #[test]
+    fn sanitize_session_id_strips_path_traversal() {
+        // alphanumerics and a few safe chars (. - _) pass through unchanged
+        assert_eq!(sanitize_session_id("user-42"), "user-42");
+        assert_eq!(sanitize_session_id("u_xyz.0"), "u_xyz.0");
+        // `/` and `\` are replaced — `..` literals stay (a filename like
+        // `.._.._etc_passwd` is safe because no separator survives).
+        assert_eq!(sanitize_session_id("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_session_id("a/b"), "a_b");
+        assert_eq!(sanitize_session_id("a\\b"), "a_b");
+        // null bytes, newlines, etc. neutered
+        assert_eq!(sanitize_session_id("a\0b"), "a_b");
+        assert_eq!(sanitize_session_id("a\nb"), "a_b");
     }
 
     #[test]

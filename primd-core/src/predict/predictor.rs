@@ -7,6 +7,7 @@
 //! Adding the trait now (before SR lands) lets us refactor [`crate::QueryContext`]
 //! once and keep its API stable across the v0.2 cycle.
 
+use super::markov::MarkovPredictor;
 use super::EventId;
 
 /// A single (event, probability) prediction returned by a predictor.
@@ -49,6 +50,19 @@ pub trait NextTurnPredictor: Send + Sync {
     /// low-rank successor matrix.
     fn confidence(&self) -> f32 {
         1.0
+    }
+
+    /// Access the underlying [`MarkovPredictor`] if this predictor wraps
+    /// one. Used by the `primd serve` per-session persistence layer to
+    /// extract Markov state at session reset without needing to downcast
+    /// concrete types.
+    ///
+    /// Default `None`. [`MarkovPredictor`] itself returns `Some(self)`; the
+    /// `HybridPredictor` in `primd-sr` returns `Some(&self.markov)`. Pure
+    /// SR predictors return `None` — they have no Markov state to persist
+    /// in the v0.2.6 surface (full SR persistence is a v0.2.7 deliverable).
+    fn as_markov(&self) -> Option<&MarkovPredictor> {
+        None
     }
 }
 
