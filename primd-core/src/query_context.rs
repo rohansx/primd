@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::cold_tier::ColdTier;
 use crate::embed::binary::BinarySignature;
 use crate::index::shards::{HierarchicalIndex, SearchOptions};
 use crate::predict::{
@@ -22,6 +23,11 @@ pub struct QueryOutput {
     pub predicted_events: Vec<EventId>,
     pub shard_scope_size: usize,
     pub served_by: ServedBy,
+    /// Cold-tier hits, if a cold tier was attached and contained
+    /// relevant signatures. Empty when no cold tier is present, the
+    /// cold tier is empty, or no cold-tier hits matched the query.
+    /// Each tuple is `(hamming_distance, event_id, doc_idx)`.
+    pub cold_results: Vec<(u32, EventId, usize)>,
 }
 
 pub struct QueryContext {
@@ -34,6 +40,12 @@ pub struct QueryContext {
     predicted_scope: Vec<usize>,
     cached_results: Option<Vec<(u32, usize)>>,
     cached_for_sig: Option<BinarySignature>,
+    /// Optional cold tier (v0.4). When set, [`Self::finalize`] also
+    /// queries the cold tier and merges results with the hot-tier hits.
+    /// Independent of the hot path: hot tier still serves the cache-hit
+    /// fast path; cold tier supplements when the hot tier returns
+    /// sparse hits.
+    cold_tier: Option<Box<dyn ColdTier>>,
 }
 
 impl QueryContext {
@@ -60,7 +72,21 @@ impl QueryContext {
             predicted_scope: Vec::new(),
             cached_results: None,
             cached_for_sig: None,
+            cold_tier: None,
         }
+    }
+
+    /// Attach a cold tier. After this, every [`Self::finalize`] also
+    /// queries the cold tier and merges results with hot-tier hits
+    /// before returning the top-K.
+    pub fn with_cold_tier(mut self, cold: Box<dyn ColdTier>) -> Self {
+        self.cold_tier = Some(cold);
+        self
+    }
+
+    /// Whether a cold tier is attached.
+    pub fn has_cold_tier(&self) -> bool {
+        self.cold_tier.is_some()
     }
 
     pub fn with_search_options(mut self, options: SearchOptions) -> Self {
@@ -140,11 +166,14 @@ impl QueryContext {
             && spec.hamming_distance(&final_sig) <= 16
             && cached.len() == top_k
         {
+            let cached_clone = cached.clone();
             return self.finish(
                 index,
-                cached.clone(),
+                cached_clone,
                 ServedBy::Speculative,
                 self.predicted_scope.len(),
+                &final_sig,
+                top_k,
             );
         }
 
@@ -155,6 +184,8 @@ impl QueryContext {
                 cached,
                 ServedBy::DeltaCache,
                 self.predicted_scope.len(),
+                &final_sig,
+                top_k,
             );
         }
 
@@ -187,7 +218,14 @@ impl QueryContext {
         } else {
             ServedBy::FullScan
         };
-        self.finish(index, search.results, served_by, search.shard_scope_size)
+        self.finish(
+            index,
+            search.results,
+            served_by,
+            search.shard_scope_size,
+            &final_sig,
+            top_k,
+        )
     }
 
     pub fn reset_utterance(&mut self) {
@@ -214,6 +252,8 @@ impl QueryContext {
         results: Vec<(u32, usize)>,
         served_by: ServedBy,
         shard_scope_size: usize,
+        final_sig: &BinarySignature,
+        top_k: usize,
     ) -> QueryOutput {
         let top_event = results
             .first()
@@ -225,6 +265,16 @@ impl QueryContext {
             }
             self.state.observe(next);
         }
+
+        // Cold-tier consultation. Only fires when a cold tier is
+        // attached and non-empty — the cost-on-no-cold-tier is one
+        // option-check.
+        let cold_results = self
+            .cold_tier
+            .as_ref()
+            .filter(|ct| !ct.is_empty())
+            .map(|ct| ct.search(final_sig, top_k))
+            .unwrap_or_default();
 
         // Carry through the predictions that drove this turn. Next-turn
         // prefetch is the caller's responsibility via warm_next, so it can
@@ -239,6 +289,7 @@ impl QueryContext {
             predicted_events,
             shard_scope_size,
             served_by,
+            cold_results,
         }
     }
 
@@ -305,6 +356,82 @@ mod tests {
         fn observe(&mut self, prev: EventId, next: EventId) {
             self.observed.lock().unwrap().push((prev, next));
         }
+    }
+
+    /// Stub cold tier: always returns the same fixed hit when searched.
+    /// Used to verify QueryContext wires `cold_results` through finalize.
+    struct StubColdTier {
+        canned_hit: (u32, EventId, usize),
+        is_empty: bool,
+    }
+
+    impl crate::cold_tier::ColdTier for StubColdTier {
+        fn len(&self) -> usize {
+            if self.is_empty { 0 } else { 1 }
+        }
+        fn add_evicted(&mut self, _sig: BinarySignature, _event: EventId, _doc_idx: usize) {}
+        fn search(&self, _query: &BinarySignature, _top_k: usize) -> Vec<(u32, EventId, usize)> {
+            if self.is_empty {
+                Vec::new()
+            } else {
+                vec![self.canned_hit]
+            }
+        }
+    }
+
+    #[test]
+    fn finalize_populates_cold_results_when_cold_tier_attached() {
+        let signatures = SignatureIndex::new(vec![sig(0x10), sig(0xF0)]);
+        let mut named = BTreeMap::new();
+        named.insert("a".to_string(), vec![0]);
+        named.insert("b".to_string(), vec![1]);
+        let events = EventCatalog::from_named_scope(&named, 2);
+        let index = HierarchicalIndex::new(signatures, events);
+
+        let cold = StubColdTier {
+            canned_hit: (42, EventId(99), 12345),
+            is_empty: false,
+        };
+        let mut ctx = QueryContext::new().with_cold_tier(Box::new(cold));
+        assert!(ctx.has_cold_tier());
+
+        let out = ctx.finalize(&index, sig(0x10), 1);
+        assert_eq!(out.cold_results, vec![(42, EventId(99), 12345)]);
+    }
+
+    #[test]
+    fn finalize_empty_cold_results_when_no_cold_tier() {
+        let signatures = SignatureIndex::new(vec![sig(0x10), sig(0xF0)]);
+        let mut named = BTreeMap::new();
+        named.insert("a".to_string(), vec![0]);
+        named.insert("b".to_string(), vec![1]);
+        let events = EventCatalog::from_named_scope(&named, 2);
+        let index = HierarchicalIndex::new(signatures, events);
+
+        let mut ctx = QueryContext::new();
+        assert!(!ctx.has_cold_tier());
+
+        let out = ctx.finalize(&index, sig(0x10), 1);
+        assert!(out.cold_results.is_empty());
+    }
+
+    #[test]
+    fn finalize_empty_cold_results_when_cold_tier_empty() {
+        let signatures = SignatureIndex::new(vec![sig(0x10), sig(0xF0)]);
+        let mut named = BTreeMap::new();
+        named.insert("a".to_string(), vec![0]);
+        named.insert("b".to_string(), vec![1]);
+        let events = EventCatalog::from_named_scope(&named, 2);
+        let index = HierarchicalIndex::new(signatures, events);
+
+        let empty_cold = StubColdTier {
+            canned_hit: (0, EventId(0), 0),
+            is_empty: true,
+        };
+        let mut ctx = QueryContext::new().with_cold_tier(Box::new(empty_cold));
+
+        let out = ctx.finalize(&index, sig(0x10), 1);
+        assert!(out.cold_results.is_empty());
     }
 
     #[test]

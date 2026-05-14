@@ -3,11 +3,13 @@
 //! This crate provides the core retrieval engine: binary quantization,
 //! SIMD-accelerated signature scanning, and hierarchical indexing.
 
+pub mod cold_tier;
 pub mod embed;
 pub mod index;
 pub mod predict;
 pub mod query_context;
 
+pub use cold_tier::ColdTier;
 pub use embed::binary::{BinarySignature, PcaProjector};
 pub use index::events::EventCatalog;
 pub use index::heap::TopKHeap;

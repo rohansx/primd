@@ -15,38 +15,14 @@
 //!   only fired when the hot tier returns too few hits to be
 //!   informative.
 
+// Re-export the canonical trait from primd-core so callers of primd-dwm
+// don't need a separate primd-core import.
+pub use primd_core::cold_tier::ColdTier;
 use primd_core::embed::binary::BinarySignature;
 use primd_core::predict::EventId;
 use serde::{Deserialize, Serialize};
 
 use crate::signature_dwm::SignatureDwm;
-
-/// Trait surface every cold-tier impl must satisfy.
-///
-/// Methods are intentionally minimal so primd-core can hold a
-/// `Box<dyn ColdTier>` without pulling in the concrete `SignatureDwm`
-/// type. v0.4.1 will add a `ColdTier` field to `QueryContext` behind
-/// an opt-in builder method.
-pub trait ColdTier: Send + Sync {
-    /// Number of signatures currently stored in the cold tier.
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Add an evicted (signature, event-id, doc-idx) triple. The
-    /// implementation is free to buffer in memory and compact lazily.
-    fn add_evicted(&mut self, sig: BinarySignature, event: EventId, doc_idx: usize);
-
-    /// Search the cold tier for the top-K nearest signatures to
-    /// `query`. Returns `(distance, event_id, doc_idx)` triples sorted
-    /// by ascending distance.
-    fn search(&self, query: &BinarySignature, top_k: usize) -> Vec<(u32, EventId, usize)>;
-
-    /// Persist the cold tier to disk (path is impl-specific).
-    fn save(&self, path: &std::path::Path) -> std::io::Result<()>;
-}
 
 /// DWM-backed cold tier. Wraps a [`SignatureDwm`] with a value-encoding
 /// scheme that packs `(EventId, doc_idx)` into the DWM's `u64` value
@@ -117,6 +93,17 @@ impl Default for DwmColdTier {
     }
 }
 
+impl DwmColdTier {
+    /// Persist the cold tier to disk. `ColdTier` keeps its trait surface
+    /// minimal; persistence is an impl-specific helper on `DwmColdTier`
+    /// directly.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let bytes = serde_json::to_vec(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, bytes)
+    }
+}
+
 impl ColdTier for DwmColdTier {
     fn len(&self) -> usize {
         self.dwm.len()
@@ -138,12 +125,6 @@ impl ColdTier for DwmColdTier {
                 (d, event, doc_idx)
             })
             .collect()
-    }
-
-    fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(path, bytes)
     }
 }
 
