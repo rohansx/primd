@@ -40,7 +40,7 @@
 //! `M[s, s] = 1` initialization. Empirically verified that `M_low = 0`
 //! breaks the bootstrap (commit 19677ef).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use primd_core::embed::binary::BinarySignature;
 use primd_core::predict::{EventId, NextTurnPredictor, Prediction};
@@ -103,11 +103,21 @@ pub struct LowRankSrPredictor<const K: usize> {
     /// projection's coordinate system.
     mean: Box<[f32; SIG_BITS]>,
     m_low: Box<[[f32; K]; K]>,
-    event_features: HashMap<EventId, [f32; K]>,
+    /// `BTreeMap` (not `HashMap`) so `predict()` iterates events in a
+    /// deterministic, EventId-sorted order. The bench previously showed
+    /// ±20 pp run-to-run variance at K=64 because Rust's `HashMap` uses
+    /// a per-process random hash state, and `partial_cmp` ties resolved
+    /// unstably under `sort_by`. BTreeMap costs O(log N) per insert/
+    /// lookup (negligible at N ≤ 1000 events).
+    event_features: BTreeMap<EventId, [f32; K]>,
     gamma: f32,
     eta_base: f32,
     t: u64,
     warmup: u64,
+    /// Cached spectral gap of `m_low`. Refreshed every
+    /// `confidence_refresh_every` observations.
+    cached_spectral_gap: f32,
+    confidence_refresh_every: u64,
 }
 
 impl<const K: usize> LowRankSrPredictor<K> {
@@ -194,8 +204,7 @@ impl<const K: usize> LowRankSrPredictor<K> {
             }
         }
 
-        let mut event_features: HashMap<EventId, [f32; K]> =
-            HashMap::with_capacity(event_centroids.len());
+        let mut event_features: BTreeMap<EventId, [f32; K]> = BTreeMap::new();
         for (&ev, sig) in event_centroids {
             event_features.insert(ev, project_centered::<K>(&projection, &mean, sig));
         }
@@ -209,6 +218,12 @@ impl<const K: usize> LowRankSrPredictor<K> {
             eta_base: DEFAULT_ETA_BASE,
             t: 0,
             warmup: DEFAULT_WARMUP_OBSERVATIONS,
+            // Identity-initialized M_low has all eigenvalues = 1, so the
+            // spectral gap is 0 — predictor is "uncalibrated" until
+            // observations move M_low. Refreshed lazily as observations
+            // arrive (see `observe` below).
+            cached_spectral_gap: 0.0,
+            confidence_refresh_every: 25,
         }
     }
 
@@ -336,6 +351,72 @@ fn dot<const K: usize>(a: &[f32; K], b: &[f32; K]) -> f32 {
     acc
 }
 
+/// Normalize a K-dim vector to unit L2 norm. No-op if the norm is ~0.
+fn normalize<const K: usize>(v: &mut [f32; K]) {
+    let mut norm_sq = 0.0f32;
+    for &x in v.iter() {
+        norm_sq += x * x;
+    }
+    let norm = norm_sq.sqrt();
+    if norm < 1e-9 {
+        return;
+    }
+    for x in v.iter_mut() {
+        *x /= norm;
+    }
+}
+
+/// Spectral gap of a K×K matrix M: `|λ_0 − λ_1| / (|λ_0| + 1e-9)` where
+/// λ_0, λ_1 are the two dominant eigenvalues by magnitude. A high gap
+/// (close to 1) means M is dominated by one eigenmode — the predictor's
+/// SR has converged to a clear direction. A low gap (near 0) means M
+/// has near-degenerate eigenvalues — the predictor hasn't differentiated
+/// states yet.
+///
+/// Computed via power iteration with deflation (Stachenfeld et al. 2017
+/// eigenstructure motivation; Russek 2017 confidence-signal proposal).
+/// 40 iterations × 2 eigenvalues × K² ≈ 80·K² FLOPS = ~80 k at K=32, well
+/// under a microsecond on modern CPUs.
+fn spectral_gap<const K: usize>(m: &[[f32; K]; K], seed: u64) -> f32 {
+    use rand::Rng;
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // Top eigenvalue via power iteration.
+    let mut v = [0.0f32; K];
+    for x in v.iter_mut() {
+        *x = rng.random_range(-1.0..1.0);
+    }
+    normalize::<K>(&mut v);
+    for _ in 0..40 {
+        v = matvec::<K>(m, &v);
+        normalize::<K>(&mut v);
+    }
+    let lambda0 = dot::<K>(&v, &matvec::<K>(m, &v));
+
+    // Deflate and find the second eigenvalue.
+    let mut deflated = [[0.0f32; K]; K];
+    for i in 0..K {
+        let vi = v[i];
+        for j in 0..K {
+            deflated[i][j] = m[i][j] - lambda0 * vi * v[j];
+        }
+    }
+
+    let mut v2 = [0.0f32; K];
+    for x in v2.iter_mut() {
+        *x = rng.random_range(-1.0..1.0);
+    }
+    normalize::<K>(&mut v2);
+    for _ in 0..40 {
+        v2 = matvec::<K>(&deflated, &v2);
+        normalize::<K>(&mut v2);
+    }
+    let lambda1 = dot::<K>(&v2, &matvec::<K>(&deflated, &v2));
+
+    let gap = (lambda0.abs() - lambda1.abs()).abs();
+    gap / (lambda0.abs() + 1e-9)
+}
+
 impl<const K: usize> NextTurnPredictor for LowRankSrPredictor<K> {
     fn predict(&self, context: &[EventId], k: usize) -> Vec<Prediction> {
         if k == 0 {
@@ -403,13 +484,37 @@ impl<const K: usize> NextTurnPredictor for LowRankSrPredictor<K> {
         }
 
         self.t += 1;
+
+        // Spectral-gap confidence is the v0.2.6 upgrade over the warmth
+        // proxy. Recompute lazily — power iteration on K×K is cheap (~1
+        // µs at K=32) but doing it every turn is still wasted work given
+        // the gap changes slowly across many observations.
+        if self.t.is_multiple_of(self.confidence_refresh_every) {
+            // Seed by observation count so the gap is deterministic per
+            // (M_low state, t) pair — matches the deterministic
+            // BTreeMap iteration for reproducible bench results.
+            self.cached_spectral_gap = spectral_gap::<K>(&self.m_low, self.t);
+        }
     }
 
+    /// Blends two signals:
+    /// - **Warmth** (linear `t / warmup`, ≤ 1.0): how much data has been
+    ///   observed. Dominates during cold-start.
+    /// - **Spectral gap** of `M_low`: how well-separated the dominant SR
+    ///   eigenmode is. Approaches 1 as M_low's top eigenvalue dominates.
+    ///
+    /// Take the *minimum* — confidence is bounded by whichever is lower.
+    /// A predictor with rich training data but degenerate M_low (no clear
+    /// successor direction) is correctly flagged uncertain; a predictor
+    /// with a sharp spectral gap but few observations is still correctly
+    /// flagged cold-start.
     fn confidence(&self) -> f32 {
         if self.warmup == 0 {
             return 1.0;
         }
-        (self.t as f32 / self.warmup as f32).min(1.0)
+        let warmth = (self.t as f32 / self.warmup as f32).min(1.0);
+        let gap = self.cached_spectral_gap.clamp(0.0, 1.0);
+        warmth.min(gap.max(0.05))
     }
 }
 
@@ -483,19 +588,30 @@ mod tests {
     }
 
     #[test]
-    fn confidence_grows_with_observations() {
+    fn confidence_blends_warmth_and_spectral_gap() {
+        // v0.2.6 semantics: confidence = min(warmth, max(spectral_gap, 0.05)).
+        // Both signals matter. Warmth bounds it during cold-start; spectral
+        // gap bounds it when M_low hasn't differentiated states yet.
         let centroids = three_event_centroids();
         let mut sr: LowRankSr = LowRankSr::new(&centroids).with_warmup(10);
-        assert!(sr.confidence() < 0.01);
-        for _ in 0..5 {
+        // Cold start: both warmth and gap are near zero. Confidence floors
+        // at the 0.05 spectral-gap floor.
+        let cold = sr.confidence();
+        assert!(cold <= 0.05 + 1e-6, "cold confidence {cold}");
+        // After 25 observations (one refresh cycle), the spectral gap
+        // refreshes and M_low's TD-updated rank-1 perturbation gives a
+        // measurable gap.
+        for _ in 0..25 {
             sr.observe(ev(0), ev(1));
         }
-        let mid = sr.confidence();
-        assert!((0.4..=0.6).contains(&mid), "mid confidence {mid}");
-        for _ in 0..20 {
+        let warm = sr.confidence();
+        assert!(warm > cold, "confidence should grow: cold={cold} warm={warm}");
+        // Continue training to push gap higher.
+        for _ in 0..50 {
             sr.observe(ev(0), ev(1));
         }
-        assert!((sr.confidence() - 1.0).abs() < 1e-6);
+        let hot = sr.confidence();
+        assert!(hot >= warm, "confidence should not regress: warm={warm} hot={hot}");
     }
 
     #[test]

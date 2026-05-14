@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -53,7 +53,11 @@ fn decay_factor(from: Instant, to: Instant, half_life: Duration) -> f32 {
 pub struct MarkovPredictor {
     tables: Vec<HashMap<Vec<EventId>, HashMap<EventId, WeightedCount>>>,
     totals: Vec<HashMap<Vec<EventId>, WeightedCount>>,
-    vocab: HashSet<EventId>,
+    /// Vocabulary as a `BTreeSet` (not `HashSet`) so `score()` iterates
+    /// events in EventId-sorted order. Ensures deterministic tiebreaking
+    /// when multiple events have equal probability under Laplace smoothing
+    /// — same fix shipped for low-rank SR's `event_features` in v0.2.6.
+    vocab: BTreeSet<EventId>,
     smoothing: f32,
     max_order: usize,
     half_life: Option<Duration>,
@@ -93,7 +97,7 @@ impl MarkovPredictor {
         Self {
             tables: vec![HashMap::new(); max_order],
             totals: vec![HashMap::new(); max_order],
-            vocab: HashSet::new(),
+            vocab: BTreeSet::new(),
             smoothing: alpha,
             max_order,
             half_life: None,

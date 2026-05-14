@@ -31,7 +31,7 @@ pub use low_rank::{
 };
 pub use pca::compute_pca;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use primd_core::predict::{EventId, MarkovPredictor, NextTurnPredictor, Prediction};
 use serde::{Deserialize, Serialize};
@@ -64,9 +64,13 @@ pub const DEFAULT_WARMUP_OBSERVATIONS: u64 = 50;
 #[derive(Clone, Debug)]
 pub struct SrPredictor {
     /// Sparse SR matrix: `M[s][s']` ∈ ℝ.
-    m: HashMap<EventId, HashMap<EventId, f32>>,
+    /// Sparse SR matrix as nested `BTreeMap` for deterministic iteration —
+    /// matches the v0.2.6 fix for `LowRankSrPredictor::event_features`.
+    /// HashMap-randomized iteration was producing ±5 pp top-1 variance
+    /// between bench runs.
+    m: BTreeMap<EventId, BTreeMap<EventId, f32>>,
     /// All observed events. Drives the column space of TD updates.
-    vocab: HashSet<EventId>,
+    vocab: BTreeSet<EventId>,
     /// Discount factor γ ∈ (0, 1).
     gamma: f32,
     /// Base learning rate.
@@ -81,8 +85,8 @@ impl SrPredictor {
     /// Predictor with defaults: γ = 0.9, η_base = 0.1, warmup = 50.
     pub fn new() -> Self {
         Self {
-            m: HashMap::new(),
-            vocab: HashSet::new(),
+            m: BTreeMap::new(),
+            vocab: BTreeSet::new(),
             gamma: DEFAULT_GAMMA,
             eta_base: DEFAULT_ETA_BASE,
             t: 0,
@@ -221,7 +225,7 @@ impl NextTurnPredictor for SrPredictor {
 
         // Snapshot the bootstrap row before mutating the source row to keep
         // the math TD(0) (not TD(λ) or some interleaved update).
-        let next_row: HashMap<EventId, f32> = self.m.get(&next).cloned().unwrap_or_default();
+        let next_row: BTreeMap<EventId, f32> = self.m.get(&next).cloned().unwrap_or_default();
         let columns: Vec<EventId> = self.vocab.iter().copied().collect();
 
         let prev_row = self.m.entry(prev).or_default();

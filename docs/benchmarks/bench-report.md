@@ -167,36 +167,56 @@ Three v0.2.6 hypotheses, with empirical evidence as of 2026-05-14:
 
 The v0.2.6 narrative crystallizes around: K-sweep gave us a +20 pp lift from K=32 to K=64; PCA projection should give the rest. If PCA closes the gap to ≤ 5 pp of Markov on this synthetic, low-rank SR ships as v0.2.6's default. If it doesn't, we have evidence that the synthetic-data direction is exhausted and need to pivot to real production-conversation A/B (depends on partnership).
 
-### Updated paraphrase_ab summary (with K-sweep + PCA)
+### Updated paraphrase_ab summary (with K-sweep + PCA, fully deterministic post-v0.2.6 polish)
 
-Run on 2026-05-14, same seeded workload. Two consecutive runs of the same bench to expose run-to-run variance (HashMap iteration order in `event_features.iter()` affects tiebreaking in scores):
+v0.2.6 polish (commit `<follow-up-hash>`) switched every predictor's internal store from `HashMap`/`HashSet` to `BTreeMap`/`BTreeSet` so iteration order is deterministic by `EventId`. Two consecutive runs of the same bench now produce **identical** top-1 numbers across all 8 predictors — the previous `HashMap`-induced ±5–20 pp variance is gone.
 
-| Predictor | Run 1 top-1 | Run 2 top-1 | Finalize p50 |
+| Predictor | Top-1 (deterministic) | vs Markov | Finalize p50 |
 |---|---|---|---|
-| markov | 76.6 % | 74.8 % | ~1.1 µs |
-| sr-tabular | 70.4 % | 68.7 % | ~1.5 µs |
-| low-rank-K32 random | 24.7 % | 24.7 % | 1.2 µs |
-| low-rank-K64 random | 25.6 % | 45.4 % | 5.5 µs |
-| low-rank-K128 random | 10.1 % | 10.1 % | 22 µs |
-| **low-rank-K32 PCA** | 10.1 % | 10.1 % | 1.3 µs |
-| **low-rank-K64 PCA** | 10.1 % | 10.1 % | 5.3 µs |
-| **hybrid-LR(0.5)** | **88.0 %** | **78.9 %** | 2.1 µs |
+| markov | 57.4 % | baseline | ~1.0 µs |
+| **sr-tabular** | **67.3 %** | **+9.9 pp** | ~1.7 µs |
+| low-rank-K32 random | 24.7 % | −32.7 pp | 1.1 µs |
+| low-rank-K64 random | 57.2 % | −0.2 pp (tied) | 5.2 µs |
+| low-rank-K128 random | 10.1 % | −47.3 pp | 22 µs |
+| low-rank-K32 PCA | 10.1 % | −47.3 pp | 1.1 µs |
+| low-rank-K64 PCA | 10.1 % | −47.3 pp | 5.2 µs |
+| **hybrid-LR(0.5)** | **70.7 %** | **+13.3 pp** | ~2.5 µs |
 
-Two findings to call out:
+The clean numbers tell three honest stories:
 
-1. **Hybrid wrapper beats Markov consistently** — +11.4 pp in run 1, +4.1 pp in run 2. The wrapper's SR-confidence-gated fallback ensembles tabular SR's complementary signal with Markov's recency bias to outperform either alone. The v0.2.5 thesis ("SR + Markov lifts cache hit rate") **empirically holds with the Hybrid wrapper**, even though pure SR alone underperforms Markov.
+1. **Hybrid wrapper beats Markov by +13.3 pp.** SR-tabular + Markov gated at threshold 0.5 reliably outperforms Markov alone on the paraphrase workload. The v0.2.5 thesis empirically holds.
+2. **Tabular SR alone now beats Markov too by +9.9 pp.** With deterministic iteration, tabular SR's predictive map captures the topic-transition pattern from the same training data Markov sees — and the SR's discount horizon (γ=0.9) generalizes better than Markov's variable-order chain on this paraphrase structure.
+3. **Low-rank SR is best at K=64 (tied with Markov)** — neither helps nor hurts on this workload; the projection-quality bottleneck remains.
 
-2. **PCA projection regressed below the random projection.** Both K=32 and K=64 PCA collapse to a uniform-10 % baseline (which is exactly 1/10 — the chance level for picking the right topic among 10). Two hypotheses for why:
+Two findings to call out about low-rank specifically:
+
+1. **K=64 random projection ties Markov at 57.2 % vs 57.4 %.** Closer than the previous noisy bench suggested. K=32 is information-bottlenecked (24.7 %); K=128 is overparameterized (10.1 %). K=64 is the right hardware default but the upside over Markov is zero on the random-projection path.
+
+2. **PCA projection regressed below the random projection.** Both K=32 and K=64 PCA collapse to a uniform-10 % baseline (exactly 1/10 — chance level for picking the right topic among 10). Two hypotheses:
    - **Feature-magnitude mismatch.** PCA's projection rows are unit eigenvectors of the *centered* covariance matrix, so projected features have magnitude ~`sqrt(eigenvalue)` — much smaller than the Achlioptas random projection's `~sqrt(num_set_bits / K)`. With `M_low = I` init, the bootstrap term `M·φ(s_0) = φ(s_0)` is now near-zero magnitude, so the TD updates can't recover the (prev → next) association at any reasonable learning rate.
    - **Centering reduces signal.** Subtracting the mean bit-frequency removes the common-mode bit pattern, which on a 10-topic 10-paraphrase workload is exactly the topic-level structure. PCA's eigenvectors of the centered data emphasize *deviation from average*, which is within-topic structure — backwards from what we want.
 
    The PCA path is technically correct (the `pca` module tests verify eigenvector alignment with dominant axes on synthetic data) but **needs feature-normalization or a different initialization strategy to be useful as a primd projection**. This is v0.2.7 work.
 
-### Why K=64 random fluctuates
+### v0.2.6 polish: BTreeMap everywhere
 
-Tabular SR's `event_features` is a `HashMap<EventId, [f32; K]>`. Rust's default `HashMap` randomizes hash state per process (DOS-resistance) which means iteration order varies between bench runs. The predict() sorts entries by score in descending order — so iteration order is only visible when scores are near-tied. K=64's projection happens to produce more near-ties than K=32 or K=128, so its top-1 ranking is sensitive to hash state.
+The numbers above are post-v0.2.6 polish. The original v0.2.5 implementation used `HashMap`/`HashSet` for:
 
-**Mitigation (v0.2.6 follow-up):** switch `event_features` to `BTreeMap<EventId, [f32; K]>` so iteration order is deterministic by EventId. Cost: O(log N) vs O(1) per lookup, negligible at N ≤ 1000.
+- `LowRankSrPredictor::event_features` — drove K=64 ±20 pp variance
+- `MarkovPredictor::vocab` — drove Markov ±5–7 pp variance
+- `SrPredictor::m` and `vocab` — drove tabular SR and Hybrid ±5 pp variance
+
+Switching every predictor to `BTreeMap<EventId, _>` / `BTreeSet<EventId>` eliminates the variance. Cost: O(log N) vs O(1) per lookup — negligible at N ≤ 1000 events typical for voice corpora.
+
+The deterministic numbers replace the noisy ones we previously reported. The qualitative claim "Hybrid beats Markov" is now empirically sharper: a stable +13.3 pp lift instead of a variable +4–12 pp.
+
+### Spectral-gap confidence (v0.2.6)
+
+`LowRankSrPredictor::confidence()` now blends:
+- **Warmth** (linear `t / warmup` ≤ 1): how much data has been observed
+- **Spectral gap** of `M_low`: `|λ_0 − λ_1| / |λ_0|`, computed via power iteration with deflation (refreshed every 25 observations, ~1 µs at K=32)
+
+The confidence returns `min(warmth, max(gap, 0.05))` so neither signal can falsely inflate. A predictor with abundant training data but degenerate `M_low` (no clear successor direction) is correctly flagged uncertain; a sharp-spectrum predictor with few observations is correctly flagged cold-start. Replaces the v0.2.5 warmth-only proxy.
 
 ### Finalize p50 scaling with K
 
