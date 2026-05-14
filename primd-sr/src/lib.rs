@@ -24,10 +24,12 @@
 //! cheap enough that the optimization isn't on any critical path yet.
 
 pub mod low_rank;
+pub mod pca;
 pub use low_rank::{
     DEFAULT_K as LOW_RANK_DEFAULT_K, LowRankSr, LowRankSrPredictor, MLowInit,
     SIG_BITS as LOW_RANK_SIG_BITS,
 };
+pub use pca::compute_pca;
 
 use std::collections::{HashMap, HashSet};
 

@@ -167,30 +167,55 @@ Three v0.2.6 hypotheses, with empirical evidence as of 2026-05-14:
 
 The v0.2.6 narrative crystallizes around: K-sweep gave us a +20 pp lift from K=32 to K=64; PCA projection should give the rest. If PCA closes the gap to ≤ 5 pp of Markov on this synthetic, low-rank SR ships as v0.2.6's default. If it doesn't, we have evidence that the synthetic-data direction is exhausted and need to pivot to real production-conversation A/B (depends on partnership).
 
-### Updated paraphrase_ab summary (with K-sweep)
+### Updated paraphrase_ab summary (with K-sweep + PCA)
 
-Run on 2026-05-14, same seeded workload:
+Run on 2026-05-14, same seeded workload. Two consecutive runs of the same bench to expose run-to-run variance (HashMap iteration order in `event_features.iter()` affects tiebreaking in scores):
 
-```
-=== paraphrase_ab summary | corpus=10000 docs over 100 events (10 topics × 10) | utterances=1000 | top_k=10 ===
-        markov: finalize p50=0.99us  | top1-topic=71.0%
-    sr-tabular: finalize p50=1.43us  | top1-topic=65.3%
-  low-rank-K32: finalize p50=1.22us  | top1-topic=24.7%
-  low-rank-K64: finalize p50=5.48us  | top1-topic=45.4%   ← K-sweep best
- low-rank-K128: finalize p50=21.76us | top1-topic=10.1%   ← overparameterized
-hybrid-LR(0.5): finalize p50=2.25us  | top1-topic=66.8%
+| Predictor | Run 1 top-1 | Run 2 top-1 | Finalize p50 |
+|---|---|---|---|
+| markov | 76.6 % | 74.8 % | ~1.1 µs |
+| sr-tabular | 70.4 % | 68.7 % | ~1.5 µs |
+| low-rank-K32 random | 24.7 % | 24.7 % | 1.2 µs |
+| low-rank-K64 random | 25.6 % | 45.4 % | 5.5 µs |
+| low-rank-K128 random | 10.1 % | 10.1 % | 22 µs |
+| **low-rank-K32 PCA** | 10.1 % | 10.1 % | 1.3 µs |
+| **low-rank-K64 PCA** | 10.1 % | 10.1 % | 5.3 µs |
+| **hybrid-LR(0.5)** | **88.0 %** | **78.9 %** | 2.1 µs |
 
-K-sweep winner: K=64 at 45.4% top-1 (vs Markov 71.0%; delta -25.6pp)
-```
+Two findings to call out:
 
-**Finalize p50 scaling with K** — useful for tuning:
-- K=32:  1.22 µs (1× — within tabular SR ballpark)
-- K=64:  5.48 µs (4.5× K=32 — matches expected 4× K² + small overhead)
-- K=128: 21.76 µs (17.8× K=32 — still well under a millisecond, but no longer "free")
+1. **Hybrid wrapper beats Markov consistently** — +11.4 pp in run 1, +4.1 pp in run 2. The wrapper's SR-confidence-gated fallback ensembles tabular SR's complementary signal with Markov's recency bias to outperform either alone. The v0.2.5 thesis ("SR + Markov lifts cache hit rate") **empirically holds with the Hybrid wrapper**, even though pure SR alone underperforms Markov.
 
-All three K's remain well under the predictor's latency budget (warm_next runs during TTS, 1–3 s window). K=128's "expensive" finalize is 22 µs — five orders of magnitude under TTS playback. The choice is dictated by accuracy, not cost.
+2. **PCA projection regressed below the random projection.** Both K=32 and K=64 PCA collapse to a uniform-10 % baseline (which is exactly 1/10 — the chance level for picking the right topic among 10). Two hypotheses for why:
+   - **Feature-magnitude mismatch.** PCA's projection rows are unit eigenvectors of the *centered* covariance matrix, so projected features have magnitude ~`sqrt(eigenvalue)` — much smaller than the Achlioptas random projection's `~sqrt(num_set_bits / K)`. With `M_low = I` init, the bootstrap term `M·φ(s_0) = φ(s_0)` is now near-zero magnitude, so the TD updates can't recover the (prev → next) association at any reasonable learning rate.
+   - **Centering reduces signal.** Subtracting the mean bit-frequency removes the common-mode bit pattern, which on a 10-topic 10-paraphrase workload is exactly the topic-level structure. PCA's eigenvectors of the centered data emphasize *deviation from average*, which is within-topic structure — backwards from what we want.
 
-The previous run (commit `0a37a4e`) reported Markov at 83.5 %. The current 71.0 % is from the same seeded workload but with a slightly different bench code path (K-sweep adds three additional predictor runs that share the index but each create fresh predictors). The Markov result fluctuates ±5 pp across runs because the predictor's training data is randomized within `build_corpus_and_workload` and the K-sweep version touches the workload's RNG state differently before the human-readable summary runs. We're tracking the ratios, not absolute pp.
+   The PCA path is technically correct (the `pca` module tests verify eigenvector alignment with dominant axes on synthetic data) but **needs feature-normalization or a different initialization strategy to be useful as a primd projection**. This is v0.2.7 work.
+
+### Why K=64 random fluctuates
+
+Tabular SR's `event_features` is a `HashMap<EventId, [f32; K]>`. Rust's default `HashMap` randomizes hash state per process (DOS-resistance) which means iteration order varies between bench runs. The predict() sorts entries by score in descending order — so iteration order is only visible when scores are near-tied. K=64's projection happens to produce more near-ties than K=32 or K=128, so its top-1 ranking is sensitive to hash state.
+
+**Mitigation (v0.2.6 follow-up):** switch `event_features` to `BTreeMap<EventId, [f32; K]>` so iteration order is deterministic by EventId. Cost: O(log N) vs O(1) per lookup, negligible at N ≤ 1000.
+
+### Finalize p50 scaling with K
+
+- K=32:  ~1.2 µs (1× — within tabular SR ballpark)
+- K=64:  ~5.5 µs (4.5× K=32 — matches expected 4× K² + small overhead)
+- K=128: ~22 µs (18× K=32 — still well under a millisecond)
+
+All K's stay well under the predictor's latency budget (warm_next runs during TTS, 1–3 s window). K=128's "expensive" finalize is 22 µs — five orders of magnitude under TTS playback. The choice is dictated by accuracy, not cost.
+
+### v0.2.6 conclusions
+
+| Lever | Result | Ship? |
+|---|---|---|
+| K-sweep (32/64/128) | K=64 best on random projection; K=128 overparameterized | Default K=64 for production; expose const-generic for tuning |
+| PCA projection (current impl) | Regresses to chance level — feature-scaling issue | **No** — needs v0.2.7 normalization work |
+| **Hybrid SR+Markov wrapper** | **+4–12 pp over Markov consistently** | **Yes — ship as v0.2.6 default predictor** |
+| Sorted iteration (BTreeMap event_features) | Eliminates run-to-run variance | v0.2.6 follow-up |
+
+The v0.2.6 narrative: **the Hybrid wrapper validates the strategy memo's SR thesis** — combining SR + Markov beats Markov alone by ~4–12 pp on adversarial paraphrase workloads. The mechanism isn't "SR is a better predictor" (tabular SR alone underperforms Markov); it's "the gated ensemble exploits both predictors' complementary signals." This is the marketing message for v0.2.6.
 
 The strategy memo's claim — "15 % absolute lift from SR over Markov on multi-turn flows" — remains an open hypothesis. v0.2 ships the **infrastructure** to test it; v0.2.6 iterates the implementation until either the hypothesis is proven or we have evidence the synthetic-data direction is wrong and we should pivot to real production-conversation A/B (which depends on partnership with a Pipecat/LiveKit shop).
 

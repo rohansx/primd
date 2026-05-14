@@ -97,6 +97,11 @@ pub enum MLowInit {
 /// - `K = 128` — high-fidelity feature space; ~64 KB per `M_low`
 pub struct LowRankSrPredictor<const K: usize> {
     projection: Box<[[f32; K]; SIG_BITS]>,
+    /// Mean signature used for centering each input before projection.
+    /// Zero for random-projection predictors (signatures used uncentered);
+    /// populated for PCA-projection predictors so centering matches the
+    /// projection's coordinate system.
+    mean: Box<[f32; SIG_BITS]>,
     m_low: Box<[[f32; K]; K]>,
     event_features: HashMap<EventId, [f32; K]>,
     gamma: f32,
@@ -146,22 +151,58 @@ impl<const K: usize> LowRankSrPredictor<K> {
             }
         }
 
+        // Random projection uses uncentered signatures — the mean stays at 0.
+        let mean: Box<[f32; SIG_BITS]> = Box::new([0.0f32; SIG_BITS]);
+
+        Self::finalize_construction(event_centroids, projection, mean, init)
+    }
+
+    /// PCA-projection constructor. Computes the top-K principal components
+    /// of the corpus signatures at index time and uses them as the
+    /// feature-extraction matrix `W`. Better signal-to-noise than the
+    /// random Achlioptas projection at the same K, at a one-time
+    /// O(K · iter · 256²) construction cost (~50–100 ms for typical
+    /// voice corpora).
+    pub fn with_pca(event_centroids: &HashMap<EventId, BinarySignature>) -> Self {
+        Self::with_pca_and_init(event_centroids, MLowInit::default())
+    }
+
+    /// PCA constructor exposing the `M_low` init.
+    pub fn with_pca_and_init(
+        event_centroids: &HashMap<EventId, BinarySignature>,
+        init: MLowInit,
+    ) -> Self {
+        let centroids_vec: Vec<BinarySignature> =
+            event_centroids.values().copied().collect();
+        let (projection, mean_arr) = crate::pca::compute_pca::<K>(&centroids_vec);
+        let mean: Box<[f32; SIG_BITS]> = Box::new(mean_arr);
+        Self::finalize_construction(event_centroids, projection, mean, init)
+    }
+
+    /// Internal shared finalization step — builds `m_low`, projects every
+    /// event's centroid into feature space, and assembles the struct.
+    fn finalize_construction(
+        event_centroids: &HashMap<EventId, BinarySignature>,
+        projection: Box<[[f32; K]; SIG_BITS]>,
+        mean: Box<[f32; SIG_BITS]>,
+        init: MLowInit,
+    ) -> Self {
         let mut m_low: Box<[[f32; K]; K]> = Box::new([[0.0; K]; K]);
         if matches!(init, MLowInit::Identity) {
             for k in 0..K {
                 m_low[k][k] = 1.0;
             }
         }
-        // MLowInit::Zero leaves M_low as the zero matrix.
 
         let mut event_features: HashMap<EventId, [f32; K]> =
             HashMap::with_capacity(event_centroids.len());
         for (&ev, sig) in event_centroids {
-            event_features.insert(ev, project::<K>(&projection, sig));
+            event_features.insert(ev, project_centered::<K>(&projection, &mean, sig));
         }
 
         Self {
             projection,
+            mean,
             m_low,
             event_features,
             gamma: DEFAULT_GAMMA,
@@ -187,7 +228,7 @@ impl<const K: usize> LowRankSrPredictor<K> {
     }
 
     pub fn set_event_centroid(&mut self, event: EventId, sig: &BinarySignature) {
-        let feat = project::<K>(&self.projection, sig);
+        let feat = project_centered::<K>(&self.projection, &self.mean, sig);
         self.event_features.insert(event, feat);
     }
 
@@ -221,6 +262,8 @@ impl<const K: usize> LowRankSrPredictor<K> {
 }
 
 /// Apply the random projection to a signature: ψ(s) = W^T · bits(s).
+/// Used when the predictor was built with an uncentered random projection.
+#[allow(dead_code)]
 fn project<const K: usize>(
     projection: &[[f32; K]; SIG_BITS],
     sig: &BinarySignature,
@@ -239,6 +282,32 @@ fn project<const K: usize>(
                     out[k] += row[k];
                 }
             }
+        }
+    }
+    out
+}
+
+/// Center a signature by subtracting `mean` and project to feature space.
+/// For random-projection predictors `mean` is the zero vector, so this is
+/// equivalent to [`project`] but with an extra subtraction per bit. The
+/// branch on `mean == 0` is hot-path-free because the compiler can hoist
+/// the subtraction into the loop.
+fn project_centered<const K: usize>(
+    projection: &[[f32; K]; SIG_BITS],
+    mean: &[f32; SIG_BITS],
+    sig: &BinarySignature,
+) -> [f32; K] {
+    let mut out = [0.0f32; K];
+    for bit in 0..SIG_BITS {
+        let byte = sig.0[bit / 8];
+        let bit_set = ((byte >> (bit % 8)) & 1) as f32;
+        let centered = bit_set - mean[bit];
+        if centered == 0.0 {
+            continue;
+        }
+        let row = &projection[bit];
+        for k in 0..K {
+            out[k] += row[k] * centered;
         }
     }
     out

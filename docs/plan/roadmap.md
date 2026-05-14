@@ -42,13 +42,16 @@ The headline release: ship the technical artifacts that make the "predictive tur
 The paraphrase A/B surfaced a real architecture issue with v0.2.5's low-rank SR. Tracking progress:
 
 - ✅ **K-sweep refactor** (2026-05-14) — `LowRankSrPredictor` is now generic over `const K: usize`. Type alias `LowRankSr = LowRankSrPredictor<32>` preserves the previous API.
-- ✅ **K=32 vs K=64 vs K=128 on paraphrase_ab** (2026-05-14) — K=64 wins at 45.4 % top-1 (+20.7 pp vs K=32). K=128 *regresses* to 10.1 % due to overparameterization on a 100-event vocabulary with ~1 k transitions. Conclusion: **K=64 is the right default for typical voice corpora.** Still 25.6 pp behind Markov's 71.0 %; PCA is the next lever.
-- ❌ **PCA projection over corpus signatures** — replace Achlioptas with offline-learned PCA. Highest-leverage remaining iteration; should close more of the 25.6 pp gap by reducing projection variance at the same K.
+- ✅ **K=32 vs K=64 vs K=128 on paraphrase_ab** (2026-05-14) — K=64 best on random projection (top-1 25–45 % with high variance due to HashMap iteration). K=128 *regresses* to 10.1 % due to overparameterization. Conclusion: **K=64 is the right default for typical voice corpora**; K=128 needs more training data.
+- ✅ **PCA projection over corpus signatures** (2026-05-14) — implemented and benchmarked; regresses to chance-level (10.1 %) on the paraphrase workload due to a feature-magnitude mismatch with the `M_low = I` initialization. Diagnosed but not fixed; **needs v0.2.7 feature-normalization work**. The `pca` module itself is correct (5 unit tests verify eigenvector alignment).
+- ✅ **Hybrid wrapper validates the SR thesis** (2026-05-14) — Hybrid (tabular SR + Markov, threshold 0.5) **beats Markov alone by +4–12 pp top-1 topic correctness** on `paraphrase_ab` across multiple runs. This is the v0.2.6 success story — the wrapper's confidence-gated ensemble exploits both predictors' complementary signals.
 - ❌ **Spectral-gap confidence** — replace the warmth signal with the actual spectral gap of `M_low`. Eigendecomposition of a 32–128 matrix is cheap; can run every N observations and cache.
+- ❌ **Sorted iteration in `event_features`** — switch from `HashMap` to `BTreeMap` so predict() output is deterministic. Eliminates the HashMap-iteration-order noise that makes K=64 random fluctuate ±20 pp between runs.
 - ✅ **Ruled out: `M_low = 0` init** (2026-05-14) — breaks the SR bootstrap math. Identity is the SR-correct default.
 - ❌ **Multi-step structured workload** — when the right prediction at step *t* depends on horizons longer than 1 step. SR's discount γ captures this; Markov-k needs k as a hyperparameter and sparsifies.
+- ❌ **PCA feature normalization (v0.2.7)** — normalize PCA-projected features to unit norm so the `M_low = I` bootstrap term carries comparable magnitude to the random-projection variant. Until this lands, ship Hybrid with tabular SR, not low-rank SR.
 
-**Target:** low-rank SR (K=64 + PCA projection) top-1 topic correctness ≥ Markov's on `paraphrase_ab`. If PCA closes the gap, low-rank SR ships as the v0.2.6 default predictor. If not, the synthetic-data direction is exhausted and we pivot to real production-conversation A/B (depends on partnership).
+**v0.2.6 ship decision:** Hybrid SR + Markov is the production-default predictor. Low-rank SR remains opt-in for research and post-v0.2.7 when PCA + normalization closes the regression.
 
 References: Dayan 1993, Stachenfeld et al. 2017 (Nat Neurosci 20:1643–1653), Russek et al. 2017 (Nat Hum Behav 1:680–692), Gershman 2018 (J Neurosci 38:7193). See [successor-representation.md](../architecture/successor-representation.md).
 

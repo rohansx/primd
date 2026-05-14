@@ -443,6 +443,28 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
                 .with_gamma(0.9),
         ),
     );
+    // PCA-projection variants at the K-sweep winner (K=64) and K=32 for
+    // a fair head-to-head with the random projection at each K.
+    let r_lr32_pca = run_session(
+        "low-rank-K32-PCA",
+        &index,
+        &workload,
+        Box::new(
+            LowRankSrPredictor::<32>::with_pca(&centroids)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
+    );
+    let r_lr64_pca = run_session(
+        "low-rank-K64-PCA",
+        &index,
+        &workload,
+        Box::new(
+            LowRankSrPredictor::<64>::with_pca(&centroids)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
+    );
     let r_hybrid = run_session(
         "hybrid-LR(0.5)",
         &index,
@@ -461,45 +483,72 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
         "=== paraphrase_ab summary | corpus={} docs over {} events ({} topics × {}) | utterances={} | top_k={} ===",
         TOTAL_SIGS, VOCAB, N_TOPICS, EVENTS_PER_TOPIC, N_UTTERANCES, TOP_K
     );
-    for r in [&r_markov, &r_sr_tab, &r_lr32, &r_lr64, &r_lr128, &r_hybrid] {
+    for r in [
+        &r_markov,
+        &r_sr_tab,
+        &r_lr32,
+        &r_lr64,
+        &r_lr128,
+        &r_lr32_pca,
+        &r_lr64_pca,
+        &r_hybrid,
+    ] {
         print!("{}", r.report());
     }
 
     println!();
     println!("Top-1 topic correctness — the bench's primary content-quality metric:");
-    println!("  markov:        {:.1}%", r_markov.top1_pct());
-    println!("  sr-tabular:    {:.1}%", r_sr_tab.top1_pct());
-    println!("  low-rank-K32:  {:.1}%", r_lr32.top1_pct());
-    println!("  low-rank-K64:  {:.1}%", r_lr64.top1_pct());
-    println!("  low-rank-K128: {:.1}%", r_lr128.top1_pct());
-    println!("  hybrid-LR:     {:.1}%", r_hybrid.top1_pct());
+    println!("  markov:            {:.1}%", r_markov.top1_pct());
+    println!("  sr-tabular:        {:.1}%", r_sr_tab.top1_pct());
+    println!("  low-rank-K32:      {:.1}%", r_lr32.top1_pct());
+    println!("  low-rank-K64:      {:.1}%", r_lr64.top1_pct());
+    println!("  low-rank-K128:     {:.1}%", r_lr128.top1_pct());
+    println!("  low-rank-K32-PCA:  {:.1}%", r_lr32_pca.top1_pct());
+    println!("  low-rank-K64-PCA:  {:.1}%", r_lr64_pca.top1_pct());
+    println!("  hybrid-LR:         {:.1}%", r_hybrid.top1_pct());
 
-    let k_results = [
-        ("K=32", r_lr32.top1_pct()),
-        ("K=64", r_lr64.top1_pct()),
-        ("K=128", r_lr128.top1_pct()),
-    ];
-    let (best_k, best_pct) = k_results
-        .iter()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .copied()
-        .unwrap_or(("?", 0.0));
     let markov_pct = r_markov.top1_pct();
-    let delta = best_pct - markov_pct;
+
+    println!();
+    println!("PCA vs random projection (same K, same workload):");
+    println!(
+        "  K=32:   random={:.1}%  pca={:.1}%  delta={:+.1}pp",
+        r_lr32.top1_pct(),
+        r_lr32_pca.top1_pct(),
+        r_lr32_pca.top1_pct() - r_lr32.top1_pct()
+    );
+    println!(
+        "  K=64:   random={:.1}%  pca={:.1}%  delta={:+.1}pp",
+        r_lr64.top1_pct(),
+        r_lr64_pca.top1_pct(),
+        r_lr64_pca.top1_pct() - r_lr64.top1_pct()
+    );
+
+    let lr_best = [
+        ("K=32 random", r_lr32.top1_pct()),
+        ("K=64 random", r_lr64.top1_pct()),
+        ("K=128 random", r_lr128.top1_pct()),
+        ("K=32 PCA", r_lr32_pca.top1_pct()),
+        ("K=64 PCA", r_lr64_pca.top1_pct()),
+    ]
+    .iter()
+    .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    .copied()
+    .unwrap_or(("?", 0.0));
+    let delta_vs_markov = lr_best.1 - markov_pct;
     println!();
     println!(
-        "K-sweep winner: {} at {:.1}% top-1 (vs Markov {:.1}%; delta {:+.1}pp)",
-        best_k, best_pct, markov_pct, delta,
+        "Best low-rank variant: {} at {:.1}% top-1 (vs Markov {:.1}%; delta {:+.1}pp)",
+        lr_best.0, lr_best.1, markov_pct, delta_vs_markov,
     );
-    if delta >= 5.0 {
-        println!("✅ K-sweep closes the v0.2.5 regression — low-rank SR wins.");
-    } else if delta >= -5.0 {
-        println!(
-            "Within 5pp of Markov — projection quality (PCA over signatures) is the next lever."
-        );
+    if delta_vs_markov >= 5.0 {
+        println!("✅ Low-rank SR beats Markov — ship as v0.2.6 default predictor.");
+    } else if delta_vs_markov >= -5.0 {
+        println!("Within 5pp of Markov — Hybrid wrapper deploys SR safely; consider per-corpus tuning.");
     } else {
         println!(
-            "Still significantly below Markov — projection quality is likely the limiting factor."
+            "Still significantly below Markov — pivot to real production-conversation A/B \
+             (depends on partnership)."
         );
     }
 }
