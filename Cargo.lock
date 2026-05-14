@@ -2030,6 +2030,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "primd-core",
+ "primd-dwm",
  "primd-sr",
  "serde",
  "serde_json",
