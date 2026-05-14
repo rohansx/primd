@@ -25,7 +25,8 @@
 
 pub mod low_rank;
 pub use low_rank::{
-    LowRankSrPredictor, MLowInit, K as LOW_RANK_K, SIG_BITS as LOW_RANK_SIG_BITS,
+    DEFAULT_K as LOW_RANK_DEFAULT_K, LowRankSr, LowRankSrPredictor, MLowInit,
+    SIG_BITS as LOW_RANK_SIG_BITS,
 };
 
 use std::collections::{HashMap, HashSet};

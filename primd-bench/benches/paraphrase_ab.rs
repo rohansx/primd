@@ -343,14 +343,44 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("low_rank_sr", |b| {
+    group.bench_function("low_rank_K32", |b| {
         b.iter(|| {
             let _ = run_session(
-                "low-rank",
+                "low-rank-K32",
                 &index,
                 &workload,
                 Box::new(
-                    LowRankSrPredictor::new(&centroids)
+                    LowRankSrPredictor::<32>::new(&centroids)
+                        .with_warmup(40)
+                        .with_gamma(0.9),
+                ),
+            );
+        });
+    });
+
+    group.bench_function("low_rank_K64", |b| {
+        b.iter(|| {
+            let _ = run_session(
+                "low-rank-K64",
+                &index,
+                &workload,
+                Box::new(
+                    LowRankSrPredictor::<64>::new(&centroids)
+                        .with_warmup(40)
+                        .with_gamma(0.9),
+                ),
+            );
+        });
+    });
+
+    group.bench_function("low_rank_K128", |b| {
+        b.iter(|| {
+            let _ = run_session(
+                "low-rank-K128",
+                &index,
+                &workload,
+                Box::new(
+                    LowRankSrPredictor::<128>::new(&centroids)
                         .with_warmup(40)
                         .with_gamma(0.9),
                 ),
@@ -383,12 +413,32 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
         &workload,
         Box::new(SrPredictor::new().with_warmup(40).with_gamma(0.9)),
     );
-    let r_lr = run_session(
-        "low-rank-sr",
+    let r_lr32 = run_session(
+        "low-rank-K32",
         &index,
         &workload,
         Box::new(
-            LowRankSrPredictor::new(&centroids)
+            LowRankSrPredictor::<32>::new(&centroids)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
+    );
+    let r_lr64 = run_session(
+        "low-rank-K64",
+        &index,
+        &workload,
+        Box::new(
+            LowRankSrPredictor::<64>::new(&centroids)
+                .with_warmup(40)
+                .with_gamma(0.9),
+        ),
+    );
+    let r_lr128 = run_session(
+        "low-rank-K128",
+        &index,
+        &workload,
+        Box::new(
+            LowRankSrPredictor::<128>::new(&centroids)
                 .with_warmup(40)
                 .with_gamma(0.9),
         ),
@@ -411,61 +461,47 @@ fn bench_paraphrase_ab(c: &mut Criterion) {
         "=== paraphrase_ab summary | corpus={} docs over {} events ({} topics × {}) | utterances={} | top_k={} ===",
         TOTAL_SIGS, VOCAB, N_TOPICS, EVENTS_PER_TOPIC, N_UTTERANCES, TOP_K
     );
-    for r in [&r_markov, &r_sr_tab, &r_lr, &r_hybrid] {
+    for r in [&r_markov, &r_sr_tab, &r_lr32, &r_lr64, &r_lr128, &r_hybrid] {
         print!("{}", r.report());
     }
 
     println!();
-    println!(
-        "Cache-hit summary: markov={:.1}% sr-tabular={:.1}% low-rank={:.1}% hybrid-LR={:.1}%",
-        r_markov.served_overall.hit_pct(),
-        r_sr_tab.served_overall.hit_pct(),
-        r_lr.served_overall.hit_pct(),
-        r_hybrid.served_overall.hit_pct(),
-    );
-    println!(
-        "Top1-topic-correct: markov={:.1}% sr-tabular={:.1}% low-rank={:.1}% hybrid-LR={:.1}%",
-        r_markov.top1_pct(),
-        r_sr_tab.top1_pct(),
-        r_lr.top1_pct(),
-        r_hybrid.top1_pct(),
-    );
-    println!(
-        "Top10-topic-present: markov={:.1}% sr-tabular={:.1}% low-rank={:.1}% hybrid-LR={:.1}%",
-        r_markov.topk_pct(),
-        r_sr_tab.topk_pct(),
-        r_lr.topk_pct(),
-        r_hybrid.topk_pct(),
-    );
+    println!("Top-1 topic correctness — the bench's primary content-quality metric:");
+    println!("  markov:        {:.1}%", r_markov.top1_pct());
+    println!("  sr-tabular:    {:.1}%", r_sr_tab.top1_pct());
+    println!("  low-rank-K32:  {:.1}%", r_lr32.top1_pct());
+    println!("  low-rank-K64:  {:.1}%", r_lr64.top1_pct());
+    println!("  low-rank-K128: {:.1}%", r_lr128.top1_pct());
+    println!("  hybrid-LR:     {:.1}%", r_hybrid.top1_pct());
 
-    let top1_delta = r_lr.top1_pct() - r_markov.top1_pct();
-    let topk_delta = r_lr.topk_pct() - r_markov.topk_pct();
+    let k_results = [
+        ("K=32", r_lr32.top1_pct()),
+        ("K=64", r_lr64.top1_pct()),
+        ("K=128", r_lr128.top1_pct()),
+    ];
+    let (best_k, best_pct) = k_results
+        .iter()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .copied()
+        .unwrap_or(("?", 0.0));
+    let markov_pct = r_markov.top1_pct();
+    let delta = best_pct - markov_pct;
     println!();
     println!(
-        "Low-rank SR vs Markov on PARAPHRASE workload (content quality):"
+        "K-sweep winner: {} at {:.1}% top-1 (vs Markov {:.1}%; delta {:+.1}pp)",
+        best_k, best_pct, markov_pct, delta,
     );
-    println!(
-        "  top1-topic-correct delta:  {:+.1}pp ({})",
-        top1_delta,
-        if top1_delta >= 5.0 {
-            "✅ low-rank SR's signature-feature pooling wins on top-1"
-        } else if top1_delta >= 0.0 {
-            "tied / marginal at top-1"
-        } else {
-            "Markov wins top-1 — investigate"
-        }
-    );
-    println!(
-        "  top10-topic-present delta: {:+.1}pp ({})",
-        topk_delta,
-        if topk_delta >= 5.0 {
-            "✅ low-rank SR's scope union covers the intended topic more often"
-        } else if topk_delta >= 0.0 {
-            "tied / marginal at top-K"
-        } else {
-            "Markov wins top-K — investigate"
-        }
-    );
+    if delta >= 5.0 {
+        println!("✅ K-sweep closes the v0.2.5 regression — low-rank SR wins.");
+    } else if delta >= -5.0 {
+        println!(
+            "Within 5pp of Markov — projection quality (PCA over signatures) is the next lever."
+        );
+    } else {
+        println!(
+            "Still significantly below Markov — projection quality is likely the limiting factor."
+        );
+    }
 }
 
 criterion_group!(paraphrase_ab_benches, bench_paraphrase_ab);

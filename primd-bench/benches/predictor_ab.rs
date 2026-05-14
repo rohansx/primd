@@ -37,7 +37,7 @@ use primd_core::index::shards::HierarchicalIndex;
 use primd_core::index::signatures::SignatureIndex;
 use primd_core::predict::{EventId, MarkovPredictor, NextTurnPredictor};
 use primd_core::query_context::{QueryContext, ServedBy};
-use primd_sr::{HybridPredictor, LowRankSrPredictor, SrPredictor};
+use primd_sr::{HybridPredictor, LowRankSr, SrPredictor};
 
 const SEED: u64 = 0xCAFE_F00D;
 const VOCAB: u32 = 50;
@@ -279,7 +279,7 @@ fn run_all(
         index,
         workload,
         Box::new(
-            LowRankSrPredictor::new(centroids)
+            LowRankSr::new(centroids)
                 .with_warmup(40)
                 .with_gamma(0.9),
         ),
@@ -323,7 +323,7 @@ fn bench_predictor_ab(c: &mut Criterion) {
                 &index,
                 &workload,
                 Box::new(
-                    LowRankSrPredictor::new(&centroids)
+                    LowRankSr::new(&centroids)
                         .with_warmup(40)
                         .with_gamma(0.9),
                 ),

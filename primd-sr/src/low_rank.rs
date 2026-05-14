@@ -2,17 +2,17 @@
 //!
 //! v0.2.5 work: where v0.2's tabular SR ([`super::SrPredictor`]) treats
 //! `EventId`s as opaque atoms, the low-rank variant projects each event's
-//! 256-bit signature into a K-dim feature space (K=32, one cache line ×
-//! 4 SIMD lanes of f64) and maintains an SR matrix `M_low: ℝ^{K×K}` over
-//! that feature space.
+//! 256-bit signature into a K-dim feature space and maintains an SR matrix
+//! `M_low: ℝ^{K×K}` over that feature space.
 //!
-//! The win this unlocks (per Stachenfeld, Botvinick, Gershman 2017 and
-//! Russek et al. 2017) is **paraphrase generalization**: events with
-//! similar signatures share predictive structure through `M_low`, so a
-//! novel paraphrase of a known intent inherits its successor distribution
-//! without separate observations.
+//! K is a const-generic parameter on [`LowRankSrPredictor`]. The 2026-05-14
+//! `paraphrase_ab` bench surfaced that K=32 is information-bottlenecked
+//! on a 10-topic-× 10-paraphrase workload (top-1 topic correctness 24.7 %
+//! vs Markov's 83.5 %). v0.2.6 explores K=64 and K=128 against the same
+//! bench; the public API of the predictor stays stable across K because
+//! the trait surface ([`NextTurnPredictor`]) is concrete-type-agnostic.
 //!
-//! The math:
+//! The math (independent of K):
 //!
 //! - Feature map: `ψ(s) = W^T · sig_bits(s) ∈ ℝ^K`, where W ∈ ℝ^{256×K}
 //!   is a fixed random projection (deterministic from a seed).
@@ -30,13 +30,15 @@
 //! bootstrap  = M_low · φ_{t+1}
 //! target     = φ_t + γ · bootstrap
 //! δ          = target − prediction
-//! M_low     += η · δ ⊗ φ_t^T   (K×K outer product, ~1 µs at K=32)
+//! M_low     += η · δ ⊗ φ_t^T   (K×K outer product; ~1 µs at K=32,
+//!                                ~4 µs at K=64, ~16 µs at K=128)
 //! ```
 //!
 //! Init: `M_low = I` so that on the first observation the bootstrap term
 //! correctly carries the t=0 self-visit `φ(s_t)` through to the prediction.
 //! This is the signature-feature-space analogue of tabular SR's
-//! `M[s, s] = 1` initialization.
+//! `M[s, s] = 1` initialization. Empirically verified that `M_low = 0`
+//! breaks the bootstrap (commit 19677ef).
 
 use std::collections::HashMap;
 
@@ -45,13 +47,17 @@ use primd_core::predict::{EventId, NextTurnPredictor, Prediction};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-/// Feature-space dimensionality. One cache line of f64 × 4 SIMD lanes.
-/// Const for now — making it a const generic is v0.3 work if we end up
-/// wanting K=64 or K=16 in production.
-pub const K: usize = 32;
-
-/// Bit-width of the signature space.
+/// Bit-width of the signature space. Independent of the predictor's K.
 pub const SIG_BITS: usize = 256;
+
+/// Default value for the const-generic K parameter — preserves v0.2.5's
+/// "K=32 = one cache line × 4 SIMD lanes of f64" choice for the existing
+/// API surface. v0.2.6 experimentally sweeps K and may change this.
+pub const DEFAULT_K: usize = 32;
+
+/// Type alias for the default-K variant. `LowRankSr` writes shorter than
+/// `LowRankSrPredictor<32>` and reads more clearly at call sites.
+pub type LowRankSr = LowRankSrPredictor<DEFAULT_K>;
 
 /// Default seed for the random projection. Fixed so two LowRankSrPredictor
 /// instances built from the same corpus produce identical feature spaces
@@ -62,44 +68,6 @@ pub const DEFAULT_GAMMA: f32 = 0.9;
 pub const DEFAULT_ETA_BASE: f32 = 0.05;
 pub const DEFAULT_WARMUP_OBSERVATIONS: u64 = 50;
 
-/// Per-row feature vector (length K).
-type FeatureVec = [f32; K];
-
-/// `K × K` low-rank SR matrix.
-type LowRankMatrix = [[f32; K]; K];
-
-/// Low-rank Successor Representation predictor over signature features.
-///
-/// Maintained state:
-/// - `projection`: fixed `256×K` random projection W. Built deterministically
-///   from the seed; never mutated.
-/// - `m_low`: learned `K×K` SR matrix. Configurable initialization — see
-///   [`MLowInit`].
-/// - `event_features`: cached `ψ(centroid)` for each known event, computed
-///   from the corpus signatures the caller supplies at init.
-pub struct LowRankSrPredictor {
-    projection: Box<[FeatureVec; SIG_BITS]>,
-    m_low: Box<LowRankMatrix>,
-    event_features: HashMap<EventId, FeatureVec>,
-    gamma: f32,
-    eta_base: f32,
-    t: u64,
-    warmup: u64,
-}
-
-/// How to initialize `M_low` before any observations.
-///
-/// Identity init is the bootstrap-correct default — on the first observation,
-/// `prediction = M·φ_prev = φ_prev` so the TD target absorbs the t=0
-/// self-visit cleanly. BUT on workloads where the user's *next* event lives
-/// in a different topic from the current one, identity-biased predictions
-/// rank within-topic-similar events first, which is exactly backwards
-/// (`paraphrase_ab` bench, 2026-05-14: identity init scored 24.7 % top-1
-/// vs 83.5 % for Markov on a 10-topic paraphrase workload).
-///
-/// Zero init means predictions are empty until `M_low` has been TD-updated
-/// by enough observations to escape the all-zero state — at which point
-/// the predictor has actually learned the data instead of starting biased.
 /// Identity is the SR-correct default: the t=0 self-visit term (visiting
 /// `s_0` once at the start) is carried by `M_low·φ(s_0) = φ(s_0)` which
 /// bootstraps subsequent TD updates correctly. We considered switching to
@@ -116,25 +84,34 @@ pub enum MLowInit {
     #[default]
     Identity,
     /// `M_low = 0`. Research knob — see [`MLowInit`] docs for why this is
-    /// not a working default. Useful for SR-from-scratch experiments where
-    /// you want to verify learning dynamics independent of the bootstrap.
+    /// not a working default.
     Zero,
 }
 
-impl LowRankSrPredictor {
+/// Low-rank Successor Representation predictor over signature features,
+/// parameterized by the feature-space dimensionality `K`.
+///
+/// Common choices:
+/// - `K = 32` — one cache line × 4 SIMD lanes of f64; the v0.2.5 default
+/// - `K = 64` — better information preservation at 4× TD update cost
+/// - `K = 128` — high-fidelity feature space; ~64 KB per `M_low`
+pub struct LowRankSrPredictor<const K: usize> {
+    projection: Box<[[f32; K]; SIG_BITS]>,
+    m_low: Box<[[f32; K]; K]>,
+    event_features: HashMap<EventId, [f32; K]>,
+    gamma: f32,
+    eta_base: f32,
+    t: u64,
+    warmup: u64,
+}
+
+impl<const K: usize> LowRankSrPredictor<K> {
     /// Build a predictor seeded from the provided event signatures.
-    ///
-    /// `event_centroids` maps each known event to its centroid signature
-    /// (typically the mean bit-vector across the event's documents, then
-    /// rebinarized — or just one representative signature). Events not
-    /// present here will return empty predictions until observed in
-    /// `observe` calls.
     pub fn new(event_centroids: &HashMap<EventId, BinarySignature>) -> Self {
-        Self::with_seed(event_centroids, DEFAULT_PROJECTION_SEED)
+        Self::with_seed_and_init(event_centroids, DEFAULT_PROJECTION_SEED, MLowInit::default())
     }
 
-    /// Same as [`Self::new`] with an explicit projection seed. Useful for
-    /// A/B testing different random-projection draws.
+    /// Same as [`Self::new`] with an explicit projection seed.
     pub fn with_seed(
         event_centroids: &HashMap<EventId, BinarySignature>,
         seed: u64,
@@ -142,7 +119,13 @@ impl LowRankSrPredictor {
         Self::with_seed_and_init(event_centroids, seed, MLowInit::default())
     }
 
-    /// Full constructor exposing the `M_low` initialization. See [`MLowInit`].
+    /// Convenience over [`Self::with_seed_and_init`] for the default seed case.
+    pub fn with_init(event_centroids: &HashMap<EventId, BinarySignature>, init: MLowInit) -> Self {
+        Self::with_seed_and_init(event_centroids, DEFAULT_PROJECTION_SEED, init)
+    }
+
+    /// Full constructor exposing both the projection seed and the `M_low`
+    /// initialization. See [`MLowInit`].
     pub fn with_seed_and_init(
         event_centroids: &HashMap<EventId, BinarySignature>,
         seed: u64,
@@ -156,14 +139,14 @@ impl LowRankSrPredictor {
         // expectation and is bit-shift-cheap to evaluate (the bit-vector
         // dot product becomes a signed sum).
         let scale = 1.0 / (K as f32).sqrt();
-        let mut projection: Box<[FeatureVec; SIG_BITS]> = Box::new([[0.0; K]; SIG_BITS]);
+        let mut projection: Box<[[f32; K]; SIG_BITS]> = Box::new([[0.0; K]; SIG_BITS]);
         for bit in 0..SIG_BITS {
-            for k in 0..K {
-                projection[bit][k] = if rng.random_bool(0.5) { scale } else { -scale };
+            for col in 0..K {
+                projection[bit][col] = if rng.random_bool(0.5) { scale } else { -scale };
             }
         }
 
-        let mut m_low: Box<LowRankMatrix> = Box::new([[0.0; K]; K]);
+        let mut m_low: Box<[[f32; K]; K]> = Box::new([[0.0; K]; K]);
         if matches!(init, MLowInit::Identity) {
             for k in 0..K {
                 m_low[k][k] = 1.0;
@@ -171,11 +154,10 @@ impl LowRankSrPredictor {
         }
         // MLowInit::Zero leaves M_low as the zero matrix.
 
-        // Precompute event features from centroids.
-        let mut event_features: HashMap<EventId, FeatureVec> =
+        let mut event_features: HashMap<EventId, [f32; K]> =
             HashMap::with_capacity(event_centroids.len());
         for (&ev, sig) in event_centroids {
-            event_features.insert(ev, project(&projection, sig));
+            event_features.insert(ev, project::<K>(&projection, sig));
         }
 
         Self {
@@ -187,12 +169,6 @@ impl LowRankSrPredictor {
             t: 0,
             warmup: DEFAULT_WARMUP_OBSERVATIONS,
         }
-    }
-
-    /// Build a predictor with explicit `M_low` initialization. Convenience
-    /// over [`Self::with_seed_and_init`] for the default seed case.
-    pub fn with_init(event_centroids: &HashMap<EventId, BinarySignature>, init: MLowInit) -> Self {
-        Self::with_seed_and_init(event_centroids, DEFAULT_PROJECTION_SEED, init)
     }
 
     pub fn with_gamma(mut self, gamma: f32) -> Self {
@@ -210,10 +186,8 @@ impl LowRankSrPredictor {
         self
     }
 
-    /// Set the feature vector for an event explicitly — useful when a
-    /// caller has computed a centroid by some other means than mean-bits.
     pub fn set_event_centroid(&mut self, event: EventId, sig: &BinarySignature) {
-        let feat = project(&self.projection, sig);
+        let feat = project::<K>(&self.projection, sig);
         self.event_features.insert(event, feat);
     }
 
@@ -229,7 +203,10 @@ impl LowRankSrPredictor {
         self.gamma
     }
 
-    /// Lookup `M_low[i][j]` for inspection.
+    pub fn k(&self) -> usize {
+        K
+    }
+
     pub fn m_low(&self, i: usize, j: usize) -> f32 {
         self.m_low[i][j]
     }
@@ -238,13 +215,16 @@ impl LowRankSrPredictor {
         self.eta_base / (1.0 + 0.01 * self.t as f32)
     }
 
-    fn feature_of(&self, event: EventId) -> Option<&FeatureVec> {
+    fn feature_of(&self, event: EventId) -> Option<&[f32; K]> {
         self.event_features.get(&event)
     }
 }
 
 /// Apply the random projection to a signature: ψ(s) = W^T · bits(s).
-fn project(projection: &[FeatureVec; SIG_BITS], sig: &BinarySignature) -> FeatureVec {
+fn project<const K: usize>(
+    projection: &[[f32; K]; SIG_BITS],
+    sig: &BinarySignature,
+) -> [f32; K] {
     let mut out = [0.0f32; K];
     for byte_idx in 0..32 {
         let byte = sig.0[byte_idx];
@@ -265,7 +245,7 @@ fn project(projection: &[FeatureVec; SIG_BITS], sig: &BinarySignature) -> Featur
 }
 
 /// Matrix-vector product M · v with M stored row-major.
-fn matvec(m: &LowRankMatrix, v: &FeatureVec) -> FeatureVec {
+fn matvec<const K: usize>(m: &[[f32; K]; K], v: &[f32; K]) -> [f32; K] {
     let mut out = [0.0f32; K];
     for i in 0..K {
         let row = &m[i];
@@ -279,7 +259,7 @@ fn matvec(m: &LowRankMatrix, v: &FeatureVec) -> FeatureVec {
 }
 
 /// Dot product.
-fn dot(a: &FeatureVec, b: &FeatureVec) -> f32 {
+fn dot<const K: usize>(a: &[f32; K], b: &[f32; K]) -> f32 {
     let mut acc = 0.0f32;
     for k in 0..K {
         acc += a[k] * b[k];
@@ -287,7 +267,7 @@ fn dot(a: &FeatureVec, b: &FeatureVec) -> f32 {
     acc
 }
 
-impl NextTurnPredictor for LowRankSrPredictor {
+impl<const K: usize> NextTurnPredictor for LowRankSrPredictor<K> {
     fn predict(&self, context: &[EventId], k: usize) -> Vec<Prediction> {
         if k == 0 {
             return Vec::new();
@@ -300,16 +280,13 @@ impl NextTurnPredictor for LowRankSrPredictor {
             Some(f) => *f,
             None => return Vec::new(),
         };
-        // Predicted feature row for the discounted future from `last`.
-        let predicted = matvec(&self.m_low, &phi_last);
+        let predicted = matvec::<K>(&self.m_low, &phi_last);
 
-        // Score each known event by its alignment with the predicted
-        // feature trajectory.
         let mut scored: Vec<(EventId, f32)> = self
             .event_features
             .iter()
             .filter(|&(&ev, _)| ev != last)
-            .map(|(&ev, feat)| (ev, dot(feat, &predicted).max(0.0)))
+            .map(|(&ev, feat)| (ev, dot::<K>(feat, &predicted).max(0.0)))
             .collect();
 
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -329,9 +306,6 @@ impl NextTurnPredictor for LowRankSrPredictor {
     }
 
     fn observe(&mut self, prev: EventId, next: EventId) {
-        // We can only meaningfully TD-update when both endpoints have
-        // cached features. Events outside the catalog are no-ops here,
-        // mirroring tabular SR's behavior for never-seen states.
         let phi_prev = match self.feature_of(prev) {
             Some(f) => *f,
             None => return,
@@ -344,16 +318,14 @@ impl NextTurnPredictor for LowRankSrPredictor {
         let eta = self.eta();
         let gamma = self.gamma;
 
-        let prediction = matvec(&self.m_low, &phi_prev);
-        let bootstrap = matvec(&self.m_low, &phi_next);
+        let prediction = matvec::<K>(&self.m_low, &phi_prev);
+        let bootstrap = matvec::<K>(&self.m_low, &phi_next);
 
-        // δ = φ_prev + γ · bootstrap − prediction
         let mut delta = [0.0f32; K];
         for k in 0..K {
             delta[k] = phi_prev[k] + gamma * bootstrap[k] - prediction[k];
         }
 
-        // M_low += η · δ ⊗ φ_prev
         for (i, row) in self.m_low.iter_mut().enumerate() {
             let scaled = eta * delta[i];
             for j in 0..K {
@@ -390,8 +362,6 @@ mod tests {
 
     fn three_event_centroids() -> HashMap<EventId, BinarySignature> {
         let mut m = HashMap::new();
-        // Three signatures with different bit patterns so their features
-        // are distinguishable in feature space.
         m.insert(ev(0), sig_with_bits_set(&[0, 1, 2, 3, 4, 5, 6, 7]));
         m.insert(ev(1), sig_with_bits_set(&[64, 65, 66, 67, 68, 69, 70, 71]));
         m.insert(ev(2), sig_with_bits_set(&[128, 129, 130, 131, 132, 133, 134, 135]));
@@ -401,13 +371,13 @@ mod tests {
     #[test]
     fn deterministic_projection_from_seed() {
         let centroids = three_event_centroids();
-        let a = LowRankSrPredictor::with_seed(&centroids, 42);
-        let b = LowRankSrPredictor::with_seed(&centroids, 42);
+        let a: LowRankSrPredictor<32> = LowRankSrPredictor::with_seed(&centroids, 42);
+        let b: LowRankSrPredictor<32> = LowRankSrPredictor::with_seed(&centroids, 42);
         for ev in [ev(0), ev(1), ev(2)] {
             let fa = a.feature_of(ev).unwrap();
             let fb = b.feature_of(ev).unwrap();
-            for k in 0..K {
-                assert!((fa[k] - fb[k]).abs() < 1e-9, "k={k}, fa[k]={}, fb[k]={}", fa[k], fb[k]);
+            for k in 0..32 {
+                assert!((fa[k] - fb[k]).abs() < 1e-9);
             }
         }
     }
@@ -415,48 +385,38 @@ mod tests {
     #[test]
     fn different_seeds_give_different_projections() {
         let centroids = three_event_centroids();
-        let a = LowRankSrPredictor::with_seed(&centroids, 42);
-        let b = LowRankSrPredictor::with_seed(&centroids, 43);
-        // At least one feature should differ between the two seeds.
+        let a: LowRankSrPredictor<32> = LowRankSrPredictor::with_seed(&centroids, 42);
+        let b: LowRankSrPredictor<32> = LowRankSrPredictor::with_seed(&centroids, 43);
         let fa = a.feature_of(ev(0)).unwrap();
         let fb = b.feature_of(ev(0)).unwrap();
-        let any_diff = (0..K).any(|k| (fa[k] - fb[k]).abs() > 1e-6);
-        assert!(any_diff, "projections were identical for different seeds");
+        let any_diff = (0..32).any(|k| (fa[k] - fb[k]).abs() > 1e-6);
+        assert!(any_diff);
     }
 
     #[test]
     fn predict_returns_empty_when_no_observations() {
         let centroids = three_event_centroids();
-        let sr = LowRankSrPredictor::new(&centroids);
-        // M_low = I and self-prediction excluded → predictions exist but
-        // mass is spread across other events. Predict should return
-        // something nonempty.
+        let sr: LowRankSr = LowRankSr::new(&centroids);
         let preds = sr.predict(&[ev(0)], 2);
-        // After init M_low = I, ψ̂(s) = φ(s). Scores against other events
-        // are random-projection dot products which are non-negative-ish.
-        // Don't assert ordering — just that we get up to 2 entries.
         assert!(preds.len() <= 2);
     }
 
     #[test]
     fn observe_changes_m_low() {
         let centroids = three_event_centroids();
-        let mut sr = LowRankSrPredictor::new(&centroids);
-        let initial = (0..K).map(|i| sr.m_low(i, i)).sum::<f32>();
+        let mut sr: LowRankSr = LowRankSr::new(&centroids);
+        let initial = (0..32).map(|i| sr.m_low(i, i)).sum::<f32>();
         for _ in 0..50 {
             sr.observe(ev(0), ev(1));
         }
-        let updated = (0..K).map(|i| sr.m_low(i, i)).sum::<f32>();
-        assert!(
-            (initial - updated).abs() > 0.01,
-            "M_low diagonal did not change after observations: {initial} -> {updated}",
-        );
+        let updated = (0..32).map(|i| sr.m_low(i, i)).sum::<f32>();
+        assert!((initial - updated).abs() > 0.01);
     }
 
     #[test]
     fn confidence_grows_with_observations() {
         let centroids = three_event_centroids();
-        let mut sr = LowRankSrPredictor::new(&centroids).with_warmup(10);
+        let mut sr: LowRankSr = LowRankSr::new(&centroids).with_warmup(10);
         assert!(sr.confidence() < 0.01);
         for _ in 0..5 {
             sr.observe(ev(0), ev(1));
@@ -470,10 +430,10 @@ mod tests {
     }
 
     #[test]
-    fn trait_object_safe() {
+    fn trait_object_safe_at_k32() {
         let centroids = three_event_centroids();
         let mut p: Box<dyn NextTurnPredictor> = Box::new(
-            LowRankSrPredictor::new(&centroids)
+            LowRankSr::new(&centroids)
                 .with_warmup(5)
                 .with_eta_base(0.1)
                 .with_gamma(0.5),
@@ -483,8 +443,6 @@ mod tests {
         }
         let preds = p.predict(&[ev(0)], 3);
         assert!(!preds.is_empty());
-        // After many observations of 0→1, event 1 should outrank event 2
-        // in predictions from 0.
         let rank1 = preds.iter().position(|p| p.event == ev(1));
         let rank2 = preds.iter().position(|p| p.event == ev(2));
         assert!(
@@ -494,14 +452,29 @@ mod tests {
     }
 
     #[test]
+    fn trait_object_safe_at_k64() {
+        let centroids = three_event_centroids();
+        let mut p: Box<dyn NextTurnPredictor> = Box::new(
+            LowRankSrPredictor::<64>::new(&centroids)
+                .with_warmup(5)
+                .with_eta_base(0.1)
+                .with_gamma(0.5),
+        );
+        for _ in 0..20 {
+            p.observe(ev(0), ev(1));
+        }
+        let preds = p.predict(&[ev(0)], 3);
+        assert!(!preds.is_empty());
+    }
+
+    #[test]
     fn unknown_events_are_no_ops() {
         let centroids = three_event_centroids();
-        let mut sr = LowRankSrPredictor::new(&centroids);
-        let before_diag: f32 = (0..K).map(|i| sr.m_low(i, i)).sum();
-        // ev(99) is not in the catalog
+        let mut sr: LowRankSr = LowRankSr::new(&centroids);
+        let before_diag: f32 = (0..32).map(|i| sr.m_low(i, i)).sum();
         sr.observe(ev(0), ev(99));
         sr.observe(ev(99), ev(1));
-        let after_diag: f32 = (0..K).map(|i| sr.m_low(i, i)).sum();
+        let after_diag: f32 = (0..32).map(|i| sr.m_low(i, i)).sum();
         assert!((before_diag - after_diag).abs() < 1e-6);
         assert_eq!(sr.observations(), 0);
     }

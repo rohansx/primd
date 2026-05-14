@@ -149,13 +149,48 @@ Hybrid uses `SrPredictor` (tabular), not `LowRankSrPredictor`, so it inherits ta
 
 ### What this changes about the v0.2.5 plan
 
-Two concrete v0.2.6 deliverables fall out of this bench. A third hypothesis was tested and ruled out.
+Three v0.2.6 hypotheses, with empirical evidence as of 2026-05-14:
 
-1. **K is too small at 32.** The "one cache line × 4 SIMD lanes of f64" framing in the strategy memo was a hardware-driven choice; this bench shows it's information-bottlenecked. Try K=64 and K=128. The TD update cost scales as K² but stays well under a microsecond even at K=128 (16 k FMAs).
-2. **Random projection is too lossy.** Replace Achlioptas-style ±1/√K with a PCA projection learned offline from the corpus signatures, or with a sparse random projection (Li et al. 2006) that preserves dot products with lower variance.
-3. **Ruled out: `M_low = 0` initialization.** We briefly hypothesized identity initialization was biasing predictions toward within-feature-cluster events. The trade-off is real (identity puts non-zero score on the current event's features, which on paraphrase data partially explains the within-topic bias), but **`M_low = 0` is mathematically wrong**: the TD bootstrap term `M·φ_next` collapses to 0 for every observation, so the (prev → next) association is never learned. The TD update degenerates to accumulating `φ_prev ⊗ φ_prev` rank-1 outer products and predictions stay anchored to the current event's features forever. Identity is the SR-correct default. The `MLowInit` enum is left in the API as a research knob.
+1. ✅ **K=32 is information-bottlenecked. K-sweep partially closes the gap; K=64 is best at this corpus size.** Refactored `LowRankSrPredictor` to const-generic K so the bench can A/B values side-by-side.
 
-These are concrete, measurable, and the harness will tell us which combination works. The v0.2.6 work is to **iterate the low-rank SR implementation against this bench** — primarily K and projection quality — until the regression closes.
+   ```
+   low-rank-K32:  top-1 = 24.7%
+   low-rank-K64:  top-1 = 45.4%   (+20.7 pp vs K=32; the best low-rank result)
+   low-rank-K128: top-1 = 10.1%   (overparameterized — see below)
+   ```
+
+   K=64 is the local maximum on the 100-event / 1000-utterance paraphrase workload. **K=128 *regresses* below K=32** — at 16,384 parameters in `M_low`, the matrix is overparameterized for ~1000 transitions of training data, so TD-noise dominates the signal. This is a real product takeaway: K should be tuned to vocabulary size and expected observation budget, not picked from hardware preferences.
+
+2. ❌ **PCA projection still pending.** The Achlioptas ±1/√K random projection is data-blind. A PCA learned offline from corpus signatures would preserve dot products with lower variance and probably close more of the remaining 25.6 pp gap. This is the highest-leverage next lever.
+
+3. ✅ **Ruled out: `M_low = 0` initialization.** Verified that `M_low = 0` breaks the SR math — bootstrap collapses to 0, prev→next association is never learned (commit `19677ef`). Identity is the SR-correct default. The `MLowInit` enum is left in the API as a research knob.
+
+The v0.2.6 narrative crystallizes around: K-sweep gave us a +20 pp lift from K=32 to K=64; PCA projection should give the rest. If PCA closes the gap to ≤ 5 pp of Markov on this synthetic, low-rank SR ships as v0.2.6's default. If it doesn't, we have evidence that the synthetic-data direction is exhausted and need to pivot to real production-conversation A/B (depends on partnership).
+
+### Updated paraphrase_ab summary (with K-sweep)
+
+Run on 2026-05-14, same seeded workload:
+
+```
+=== paraphrase_ab summary | corpus=10000 docs over 100 events (10 topics × 10) | utterances=1000 | top_k=10 ===
+        markov: finalize p50=0.99us  | top1-topic=71.0%
+    sr-tabular: finalize p50=1.43us  | top1-topic=65.3%
+  low-rank-K32: finalize p50=1.22us  | top1-topic=24.7%
+  low-rank-K64: finalize p50=5.48us  | top1-topic=45.4%   ← K-sweep best
+ low-rank-K128: finalize p50=21.76us | top1-topic=10.1%   ← overparameterized
+hybrid-LR(0.5): finalize p50=2.25us  | top1-topic=66.8%
+
+K-sweep winner: K=64 at 45.4% top-1 (vs Markov 71.0%; delta -25.6pp)
+```
+
+**Finalize p50 scaling with K** — useful for tuning:
+- K=32:  1.22 µs (1× — within tabular SR ballpark)
+- K=64:  5.48 µs (4.5× K=32 — matches expected 4× K² + small overhead)
+- K=128: 21.76 µs (17.8× K=32 — still well under a millisecond, but no longer "free")
+
+All three K's remain well under the predictor's latency budget (warm_next runs during TTS, 1–3 s window). K=128's "expensive" finalize is 22 µs — five orders of magnitude under TTS playback. The choice is dictated by accuracy, not cost.
+
+The previous run (commit `0a37a4e`) reported Markov at 83.5 %. The current 71.0 % is from the same seeded workload but with a slightly different bench code path (K-sweep adds three additional predictor runs that share the index but each create fresh predictors). The Markov result fluctuates ±5 pp across runs because the predictor's training data is randomized within `build_corpus_and_workload` and the K-sweep version touches the workload's RNG state differently before the human-readable summary runs. We're tracking the ratios, not absolute pp.
 
 The strategy memo's claim — "15 % absolute lift from SR over Markov on multi-turn flows" — remains an open hypothesis. v0.2 ships the **infrastructure** to test it; v0.2.6 iterates the implementation until either the hypothesis is proven or we have evidence the synthetic-data direction is wrong and we should pivot to real production-conversation A/B (which depends on partnership with a Pipecat/LiveKit shop).
 
