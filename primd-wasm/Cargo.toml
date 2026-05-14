@@ -1,0 +1,28 @@
+[package]
+name = "primd-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "WebAssembly bindings for primd's predictive turn-cache runtime"
+keywords = ["voice-ai", "rag", "wasm", "primd", "browser"]
+categories = ["wasm", "algorithms"]
+readme = "../README.md"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+primd-core = { path = "../primd-core", default-features = false }
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+serde.workspace = true
+serde_json.workspace = true
+js-sys = "0.3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }

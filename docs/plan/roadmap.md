@@ -101,7 +101,7 @@ Run primd + cold tier on the standard long-horizon agent-memory benchmarks. Goal
 
 ### Track C — WASM / browser target
 
-`primd-core` compiled to WASM for in-page voice agents. Target: 10 k-doc corpus at < 10 ms p50 in the browser.
+✅ Shipped 2026-05-14. New `primd-wasm` crate (workspace member) wraps `primd-core` with wasm-bindgen for browser deployment. Builds against `wasm32-unknown-unknown` with `default-features = false` on primd-core (fastembed/openai/HNSW disabled in WASM — see [integration doc](../integrations/wasm.md) for what's available). JS-facing API: `PrimdIndex(signatures_flat, event_names, event_scopes)` constructor + `query` / `observe_partial` / `finalize` / `warm_next` methods. Output bundle is ~250 KB compressed via wasm-bindgen.
 
 ### Track D — Trust primitives
 
