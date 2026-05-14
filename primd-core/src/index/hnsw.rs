@@ -19,6 +19,7 @@
 //! unconditionally.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::RwLock;
 
 use instant_distance::{Builder, HnswMap, Point, Search};
@@ -29,6 +30,16 @@ use crate::predict::EventId;
 /// Wrapper around `BinarySignature` exposing Hamming distance to
 /// `instant-distance`. The `f32` distance contract is fine: 256-bit
 /// Hamming distance fits in [0, 256] which is well-representable.
+///
+/// Note: `instant-distance` v0.6.1's `serde` feature is upstream-broken
+/// (it references `BigArray` without depending on `serde-big-array`),
+/// so we can't directly persist `HnswMap<SignaturePoint, usize>` to disk
+/// yet. [`EventHnswCache::save_to_dir`] therefore persists only the
+/// *list of warm shards* (event ids); shards are eagerly rebuilt from
+/// the cached signatures on `load_from_dir`. That skips the lazy-on-
+/// -first-query latency for previously-warm events but doesn't avoid
+/// the build cost itself. Full HNSW-graph serialization lands once
+/// the upstream fix ships.
 #[derive(Clone, Debug)]
 struct SignaturePoint(BinarySignature);
 
@@ -110,6 +121,79 @@ impl EventHnswCache {
 
     pub fn min_shard_size(&self) -> usize {
         self.min_shard_size
+    }
+
+    /// Number of pre-built shards currently cached.
+    pub fn built_shard_count(&self) -> usize {
+        self.built.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Persist the list of warm shards. The full `HnswMap` graph
+    /// serialization is blocked on an upstream `instant-distance` v0.6.1
+    /// bug (their `serde` feature references `BigArray` without
+    /// declaring the dep), so we save only the EventIds that were built.
+    /// On [`Self::load_from_dir`], those shards are eagerly rebuilt from
+    /// the cached signatures — same wall-clock cost as cold-building
+    /// them on first query, but no per-query latency surprise for
+    /// previously-warm events.
+    ///
+    /// Returns the number of warm-shard markers written.
+    pub fn save_to_dir(&self, dir: &Path) -> std::io::Result<usize> {
+        std::fs::create_dir_all(dir)?;
+        let built = self
+            .built
+            .read()
+            .map_err(|_| std::io::Error::other("hnsw cache poisoned"))?;
+        let warm: Vec<u32> = built.keys().map(|e| e.0).collect();
+        let path = dir.join("warm_shards.json");
+        let bytes = serde_json::to_vec(&warm)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&path, bytes)?;
+        Ok(warm.len())
+    }
+
+    /// Eagerly rebuild any shards listed in `{dir}/warm_shards.json`.
+    /// Skips events not in the current scope catalog (so a stale file
+    /// from a previous corpus is harmless).
+    ///
+    /// Returns the number of shards rebuilt.
+    pub fn load_from_dir(&self, dir: &Path) -> std::io::Result<usize> {
+        let path = dir.join("warm_shards.json");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let bytes = std::fs::read(&path)?;
+        let warm: Vec<u32> = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut rebuilt = 0;
+        let mut built = self
+            .built
+            .write()
+            .map_err(|_| std::io::Error::other("hnsw cache poisoned"))?;
+        for event_id_raw in warm {
+            let event = EventId(event_id_raw);
+            if built.contains_key(&event) {
+                continue;
+            }
+            let Some(scope) = self.scopes.get(&event) else {
+                continue;
+            };
+            if scope.len() < self.min_shard_size {
+                continue;
+            }
+            let points: Vec<SignaturePoint> = scope
+                .iter()
+                .filter_map(|&idx| self.docs.get(idx).map(|s| SignaturePoint(*s)))
+                .collect();
+            let values: Vec<usize> = scope.clone();
+            let shard = Builder::default()
+                .ef_construction(self.options.ef_construction)
+                .ef_search(self.options.ef_search)
+                .build(points, values);
+            built.insert(event, shard);
+            rebuilt += 1;
+        }
+        Ok(rebuilt)
     }
 
     /// Should we even try to use HNSW for an event of this size?
@@ -287,5 +371,52 @@ mod tests {
         assert!(!cache.is_worth_hnsw(EventHnswCache::DEFAULT_MIN_SHARD_SIZE - 1));
         assert!(cache.is_worth_hnsw(EventHnswCache::DEFAULT_MIN_SHARD_SIZE));
         assert!(cache.is_worth_hnsw(50_000));
+    }
+
+    #[test]
+    fn save_and_load_warm_shards() {
+        let mut rng = StdRng::seed_from_u64(0xDADA);
+        let cache = build_cache(&mut rng, 3, 200);
+        // Warm two shards by querying them.
+        let q = random_sig(&mut rng);
+        let _ = cache.search(EventId(0), &q, 3);
+        let _ = cache.search(EventId(2), &q, 3);
+        assert_eq!(cache.built_shard_count(), 2);
+
+        let dir = std::env::temp_dir().join("primd-hnsw-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let written = cache.save_to_dir(&dir).unwrap();
+        assert_eq!(written, 2);
+
+        // Fresh cache loads the same warm shards.
+        let mut rng2 = StdRng::seed_from_u64(0xDADA);
+        let cache2 = build_cache(&mut rng2, 3, 200);
+        assert_eq!(cache2.built_shard_count(), 0);
+        let rebuilt = cache2.load_from_dir(&dir).unwrap();
+        assert_eq!(rebuilt, 2);
+        assert_eq!(cache2.built_shard_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skips_events_outside_current_scope() {
+        // Save with 3 events, load into a cache that only knows 1 event.
+        let mut rng = StdRng::seed_from_u64(0xBABE);
+        let cache = build_cache(&mut rng, 3, 200);
+        let q = random_sig(&mut rng);
+        let _ = cache.search(EventId(0), &q, 3);
+        let _ = cache.search(EventId(1), &q, 3);
+        let _ = cache.search(EventId(2), &q, 3);
+
+        let dir = std::env::temp_dir().join("primd-hnsw-stale");
+        let _ = std::fs::remove_dir_all(&dir);
+        cache.save_to_dir(&dir).unwrap();
+
+        let mut rng2 = StdRng::seed_from_u64(0xCAFE);
+        let cache2 = build_cache(&mut rng2, 1, 200); // only EventId(0) in scope
+        let rebuilt = cache2.load_from_dir(&dir).unwrap();
+        assert_eq!(rebuilt, 1);
+        assert_eq!(cache2.built_shard_count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

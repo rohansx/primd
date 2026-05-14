@@ -7,9 +7,33 @@ use std::path::Path;
 use crate::{PrimdError, Result};
 
 /// A 256-bit binary signature (32 bytes). Core type used throughout primd.
+///
+/// Serialized as a JSON array of 32 byte integers via the manual
+/// [`serde::Serialize`]/[`serde::Deserialize`] impls below. Used by the
+/// `primd-sr` LowRankSrPredictor's PCA path (centroids serialized in the
+/// `pca` module) and by any caller wanting to round-trip signatures
+/// through JSON config / state files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct BinarySignature(pub [u8; 32]);
+
+impl serde::Serialize for BinarySignature {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let mut tup = ser.serialize_tuple(32)?;
+        for byte in &self.0 {
+            tup.serialize_element(byte)?;
+        }
+        tup.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BinarySignature {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        let arr: [u8; 32] = serde::Deserialize::deserialize(de)?;
+        Ok(BinarySignature(arr))
+    }
+}
 
 impl BinarySignature {
     pub const BITS: usize = 256;
