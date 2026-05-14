@@ -192,7 +192,13 @@ Two findings to call out about low-rank specifically:
 
 1. **K=64 random projection ties Markov at 57.2 % vs 57.4 %.** Closer than the previous noisy bench suggested. K=32 is information-bottlenecked (24.7 %); K=128 is overparameterized (10.1 %). K=64 is the right hardware default but the upside over Markov is zero on the random-projection path.
 
-2. **PCA projection regressed below the random projection.** Both K=32 and K=64 PCA collapse to a uniform-10 % baseline (exactly 1/10 — chance level for picking the right topic among 10). Two hypotheses:
+2. **PCA projection regressed below the random projection.** Both K=32 and K=64 PCA collapse to a uniform-10 % baseline (exactly 1/10 — chance level for picking the right topic among 10).
+
+   **v0.2.7 update:** L2-normalization of PCA features (so the `M_low=I` bootstrap term has comparable scale to TD updates) was shipped and verified mathematically correct, but does not move the bench result off 10.1 %. The root cause is **not feature magnitude** but **PCA-over-centroids over-compressing within-topic variance**: with 10 topic centroids well-separated and 10 paraphrases per topic each only 10 bits from the centroid, ~90 % of the between-event variance is *between* topics. The top-K eigenvectors capture that between-topic structure and collapse within-topic events into nearly-identical feature vectors. `predict()` then can't differentiate which event in the *next* topic the user wanted — top-1 becomes ~uniform across 10 events in any topic = exactly the chance-level 10 % we observe.
+
+   **v0.2.8 fix candidates:** (a) PCA over individual docs (not centroids) so within-topic variation contributes to eigenvectors; (b) combine PCA + random projection in a hybrid feature space; (c) use a projection that preserves both within- and between-cluster variance (e.g., LDA-style discriminant analysis).
+
+   The L2-normalization itself (`MLowInit::Identity` + `with_pca` now normalizes) remains a correct fix for scenarios where feature magnitudes vary between predictor variants — e.g., a future hybrid projection. Original v0.2.5 hypotheses:
    - **Feature-magnitude mismatch.** PCA's projection rows are unit eigenvectors of the *centered* covariance matrix, so projected features have magnitude ~`sqrt(eigenvalue)` — much smaller than the Achlioptas random projection's `~sqrt(num_set_bits / K)`. With `M_low = I` init, the bootstrap term `M·φ(s_0) = φ(s_0)` is now near-zero magnitude, so the TD updates can't recover the (prev → next) association at any reasonable learning rate.
    - **Centering reduces signal.** Subtracting the mean bit-frequency removes the common-mode bit pattern, which on a 10-topic 10-paraphrase workload is exactly the topic-level structure. PCA's eigenvectors of the centered data emphasize *deviation from average*, which is within-topic structure — backwards from what we want.
 

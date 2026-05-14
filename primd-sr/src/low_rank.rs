@@ -102,13 +102,17 @@ pub struct LowRankSrPredictor<const K: usize> {
     /// populated for PCA-projection predictors so centering matches the
     /// projection's coordinate system.
     mean: Box<[f32; SIG_BITS]>,
+    /// v0.2.7: when true, every feature vector (event centroids at init
+    /// and query signatures at predict-time) is L2-normalized to unit
+    /// magnitude after projection. Required for PCA projections so the
+    /// `M_low=I` bootstrap term has comparable scale to the TD-learned
+    /// rank-1 outer products. Disabled by default for random projections
+    /// (which already have comfortable magnitudes), enabled by
+    /// `with_pca` / `with_pca_and_init`.
+    normalize_features: bool,
     m_low: Box<[[f32; K]; K]>,
     /// `BTreeMap` (not `HashMap`) so `predict()` iterates events in a
-    /// deterministic, EventId-sorted order. The bench previously showed
-    /// ±20 pp run-to-run variance at K=64 because Rust's `HashMap` uses
-    /// a per-process random hash state, and `partial_cmp` ties resolved
-    /// unstably under `sort_by`. BTreeMap costs O(log N) per insert/
-    /// lookup (negligible at N ≤ 1000 events).
+    /// deterministic, EventId-sorted order.
     event_features: BTreeMap<EventId, [f32; K]>,
     gamma: f32,
     eta_base: f32,
@@ -164,7 +168,7 @@ impl<const K: usize> LowRankSrPredictor<K> {
         // Random projection uses uncentered signatures — the mean stays at 0.
         let mean: Box<[f32; SIG_BITS]> = Box::new([0.0f32; SIG_BITS]);
 
-        Self::finalize_construction(event_centroids, projection, mean, init)
+        Self::finalize_construction(event_centroids, projection, mean, init, false)
     }
 
     /// PCA-projection constructor. Computes the top-K principal components
@@ -177,7 +181,10 @@ impl<const K: usize> LowRankSrPredictor<K> {
         Self::with_pca_and_init(event_centroids, MLowInit::default())
     }
 
-    /// PCA constructor exposing the `M_low` init.
+    /// PCA constructor exposing the `M_low` init. Features are L2-normalized
+    /// so the bootstrap term has comparable magnitude to the TD-learned
+    /// rank-1 outer products — fixes the v0.2.5 PCA regression where
+    /// unnormalized PCA features collapsed below the bootstrap threshold.
     pub fn with_pca_and_init(
         event_centroids: &HashMap<EventId, BinarySignature>,
         init: MLowInit,
@@ -186,7 +193,7 @@ impl<const K: usize> LowRankSrPredictor<K> {
             event_centroids.values().copied().collect();
         let (projection, mean_arr) = crate::pca::compute_pca::<K>(&centroids_vec);
         let mean: Box<[f32; SIG_BITS]> = Box::new(mean_arr);
-        Self::finalize_construction(event_centroids, projection, mean, init)
+        Self::finalize_construction(event_centroids, projection, mean, init, true)
     }
 
     /// Internal shared finalization step — builds `m_low`, projects every
@@ -196,6 +203,7 @@ impl<const K: usize> LowRankSrPredictor<K> {
         projection: Box<[[f32; K]; SIG_BITS]>,
         mean: Box<[f32; SIG_BITS]>,
         init: MLowInit,
+        normalize_features: bool,
     ) -> Self {
         let mut m_low: Box<[[f32; K]; K]> = Box::new([[0.0; K]; K]);
         if matches!(init, MLowInit::Identity) {
@@ -206,12 +214,17 @@ impl<const K: usize> LowRankSrPredictor<K> {
 
         let mut event_features: BTreeMap<EventId, [f32; K]> = BTreeMap::new();
         for (&ev, sig) in event_centroids {
-            event_features.insert(ev, project_centered::<K>(&projection, &mean, sig));
+            let mut feat = project_centered::<K>(&projection, &mean, sig);
+            if normalize_features {
+                normalize_feature::<K>(&mut feat);
+            }
+            event_features.insert(ev, feat);
         }
 
         Self {
             projection,
             mean,
+            normalize_features,
             m_low,
             event_features,
             gamma: DEFAULT_GAMMA,
@@ -243,7 +256,10 @@ impl<const K: usize> LowRankSrPredictor<K> {
     }
 
     pub fn set_event_centroid(&mut self, event: EventId, sig: &BinarySignature) {
-        let feat = project_centered::<K>(&self.projection, &self.mean, sig);
+        let mut feat = project_centered::<K>(&self.projection, &self.mean, sig);
+        if self.normalize_features {
+            normalize_feature::<K>(&mut feat);
+        }
         self.event_features.insert(event, feat);
     }
 
@@ -304,9 +320,7 @@ fn project<const K: usize>(
 
 /// Center a signature by subtracting `mean` and project to feature space.
 /// For random-projection predictors `mean` is the zero vector, so this is
-/// equivalent to [`project`] but with an extra subtraction per bit. The
-/// branch on `mean == 0` is hot-path-free because the compiler can hoist
-/// the subtraction into the loop.
+/// equivalent to [`project`] but with an extra subtraction per bit.
 fn project_centered<const K: usize>(
     projection: &[[f32; K]; SIG_BITS],
     mean: &[f32; SIG_BITS],
@@ -326,6 +340,35 @@ fn project_centered<const K: usize>(
         }
     }
     out
+}
+
+/// v0.2.7 fix: L2-normalize a feature vector so PCA-projected features
+/// have unit magnitude — same scale as the M_low=I bootstrap term.
+///
+/// The paraphrase_ab regression (low-rank-PCA top-1=10% vs Markov 75%)
+/// traced to a feature-magnitude mismatch: PCA's projection rows are
+/// unit eigenvectors of the centered covariance, so projected features
+/// have magnitude ~sqrt(eigenvalue) — tiny vs the random Achlioptas
+/// projection's ~sqrt(num_set_bits/K). With M_low=I init, the bootstrap
+/// term M·φ(s_0) = φ(s_0) is near-zero magnitude under PCA, so the TD
+/// update can't recover the (prev → next) association at the default
+/// learning rate.
+///
+/// Normalizing every feature vector to unit norm before storage equalizes
+/// the magnitude scale across projection types. Geometry (relative
+/// angles between events) is preserved.
+fn normalize_feature<const K: usize>(v: &mut [f32; K]) {
+    let mut norm_sq = 0.0f32;
+    for &x in v.iter() {
+        norm_sq += x * x;
+    }
+    let norm = norm_sq.sqrt();
+    if norm < 1e-9 {
+        return;
+    }
+    for x in v.iter_mut() {
+        *x /= norm;
+    }
 }
 
 /// Matrix-vector product M · v with M stored row-major.
