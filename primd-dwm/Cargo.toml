@@ -1,0 +1,22 @@
+[package]
+name = "primd-dwm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Dynamic Wavelet Matrix primitives for primd's Hippocampus-style cold tier"
+keywords = ["wavelet-matrix", "rank-select", "succinct", "primd", "voice-ai"]
+categories = ["data-structures", "algorithms"]
+readme = "../README.md"
+
+[dependencies]
+primd-core = { path = "../primd-core", version = "0.1", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

@@ -2053,6 +2053,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "primd-dwm"
+version = "0.1.0"
+dependencies = [
+ "primd-core",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "primd-sr"
 version = "0.1.0"
 dependencies = [

@@ -186,12 +186,19 @@ Roadmap (v0.2 — in progress):
 - Public benchmark vs Moss + Qdrant + Pinecone at the *finalize* event
 - A/B harness measuring SR vs Markov speculative-cache hit-rate lift
 
-Roadmap (v0.3):
+Roadmap (v0.3 — shipped):
 
-- `livekit-primd` packaged plugin
-- **Hippocampus Signature DWM cold tier** (first-mover Rust port of arXiv:2602.13594)
-- WASM / browser target
-- Trust primitives — confidence scores, refusal-on-uncertainty
+- ✅ `livekit-primd` packaged plugin
+- ✅ Per-event HNSW shards (`instant-distance` + lazy build)
+- ✅ Per-user predictor persistence (`--sr-state-dir`)
+- ✅ WASM / browser target (`primd-wasm`)
+- ✅ **Hippocampus DWM foundation** (`primd-dwm`) — first-mover Rust port of arXiv:2602.13594's BitVector rank/select + Random Indexing primitives. Full Signature DWM cold tier in v0.4.
+
+Roadmap (v0.4):
+
+- Signature DWM cold tier with `QueryContext` integration for multi-day session memory
+- Trust primitives — confidence scores, dataset freshness, refusal-on-uncertainty
+- Public LoCoMo / LongMemEval long-horizon recall benches
 
 ## What primd isn't
 

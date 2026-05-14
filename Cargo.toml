@@ -1,5 +1,5 @@
 [workspace]
-members = ["primd-core", "primd-cli", "primd-bench", "primd-sr", "primd-wasm"]
+members = ["primd-core", "primd-cli", "primd-bench", "primd-sr", "primd-wasm", "primd-dwm"]
 resolver = "2"
 
 [workspace.package]

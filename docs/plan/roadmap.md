@@ -112,6 +112,25 @@ Confidence scores, dataset freshness, refusal-on-uncertainty. The SR predictor's
 
 Refactor `observe_partial` so it works without discrete STT partial frames — a continuous-input `observe` that can be driven by a full-duplex model's audio embedding stream as well as Pipecat-style transcript frames. Hedges against the disappearance of STT/TTS phases.
 
+### Track F — Hippocampus DWM cold tier
+
+✅ **Foundation shipped 2026-05-14** — new `primd-dwm` workspace crate with:
+- `BitVector` with O(1) `rank_1` / `select_1` primitives via two-level lookup tables (Jacobson 1989 + Clark 1996 succinct data-structures construction). ~6.25 % auxiliary overhead. Serializable for cold-tier persistence.
+- `RandomIndexer` for zero-LLM-token signature construction per the Hippocampus paper (Appendix B). Sparse ternary base vectors + sliding-window aggregation + top-K sign-quantization → 256-bit signatures compatible with primd-core's existing pipeline.
+
+**v0.4 work to complete the cold tier:**
+- `SignatureDWM` — wavelet-matrix-backed cold-tier store layering many `BitVector`s. Append-only; supports compressed-domain Hamming-ball queries via XOR + popcount over the layered structure.
+- Integration with `QueryContext` — events evicted from hot tier (HNSW shards) move into the DWM-backed store keyed by `session_id`. Cross-session memory for multi-day voice agents.
+- Public LoCoMo / LongMemEval bench to credentialize the long-horizon recall story without competing with Hippocampus on its home turf.
+
+First-mover status: the paper (arXiv:2602.13594) had no public reference code as of May 2026. The foundation we shipped today is the first open-source port of any portion of the algorithm. Strategy memo flagged this as time-sensitive; if MLSys accepts and the authors release reference code in June–August 2026, our framing pivots from "first-mover" to "Rust-idiomatic implementation" but the work still has reference value.
+
+## Open items blocked on external dependencies
+
+- **Full HNSW-graph persistence** — blocked on upstream `instant-distance` v0.6.x serde feature fix (currently references `BigArray` without declaring the dep). The v0.3 ship works around with eager-rebuild-from-warm-EventIds, but a real graph serialization is desirable when the upstream lands. Re-evaluate every release.
+- **`cmd_serve` auto-wiring for SR / LowRank persistence** — blocked on stable Rust trait upcasting (currently nightly-only via `trait_upcasting` feature). Once stable, `Box<dyn NextTurnPredictor>` can `as_any()` into the concrete predictor for save/load. Manual `SrPredictor::save_to_file` and `LowRankSrPredictor::save_to_file` work today as opt-in APIs.
+- **Multi-threaded WASM** — Atomics + SharedArrayBuffer require COOP/COEP headers that most demos can't serve. Worth doing once we have a paying customer who needs it.
+
 ## v0.5+ — Post-pipeline-phase world (2027+)
 
 ### Model-phase hooks for full-duplex models
