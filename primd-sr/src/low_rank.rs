@@ -46,6 +46,7 @@ use primd_core::embed::binary::BinarySignature;
 use primd_core::predict::{EventId, NextTurnPredictor, Prediction};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use serde::{Deserialize, Serialize};
 
 /// Bit-width of the signature space. Independent of the predictor's K.
 pub const SIG_BITS: usize = 256;
@@ -287,6 +288,91 @@ impl<const K: usize> LowRankSrPredictor<K> {
         self.eta_base / (1.0 + 0.01 * self.t as f32)
     }
 
+    /// Persist the learned `M_low` matrix, observation count, and
+    /// configuration to disk. The projection matrix and event-centroid
+    /// features are NOT persisted — they're a property of the corpus,
+    /// not the session, and would be re-derived at load time from a
+    /// matching corpus. This keeps state files small (~K² f32 + small
+    /// header = ~4 KB at K=32) while still warm-starting the SR.
+    ///
+    /// To round-trip an SR across sessions, use [`Self::load_from_file`]
+    /// with the same corpus (so projection + centroids reproduce
+    /// identically from the same seed).
+    pub fn save_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let snapshot = LowRankSnapshot {
+            k: K,
+            t: self.t,
+            warmup: self.warmup,
+            gamma: self.gamma,
+            eta_base: self.eta_base,
+            normalize_features: self.normalize_features,
+            cached_spectral_gap: self.cached_spectral_gap,
+            confidence_refresh_every: self.confidence_refresh_every,
+            m_low_flat: self.m_low.iter().flat_map(|row| row.iter().copied()).collect(),
+        };
+        let bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, bytes)
+    }
+
+    /// Reconstruct a predictor by loading `M_low` + counters into an
+    /// otherwise freshly-built predictor. The caller is responsible for
+    /// providing matching `event_centroids` so the projection and
+    /// event-feature derivations reproduce the original layout.
+    ///
+    /// Returns [`std::io::ErrorKind::InvalidData`] if the persisted K
+    /// does not match the type's K.
+    pub fn load_from_file(
+        path: &std::path::Path,
+        event_centroids: &HashMap<EventId, BinarySignature>,
+    ) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let snap: LowRankSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        if snap.k != K {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("persisted K={} does not match expected K={}", snap.k, K),
+            ));
+        }
+        if snap.m_low_flat.len() != K * K {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "m_low_flat has {} entries; expected {}",
+                    snap.m_low_flat.len(),
+                    K * K
+                ),
+            ));
+        }
+
+        // Rebuild projection + event features by walking the same
+        // construction path as `with_pca` / `with_seed` — caller passes
+        // the matching centroids. The init flag doesn't matter here
+        // because we'll overwrite m_low immediately.
+        let mut me: Self = if snap.normalize_features {
+            Self::with_pca_and_init(event_centroids, MLowInit::Zero)
+        } else {
+            Self::with_seed_and_init(event_centroids, DEFAULT_PROJECTION_SEED, MLowInit::Zero)
+        };
+
+        // Restore M_low from the flat persisted form.
+        let mut m_low: Box<[[f32; K]; K]> = Box::new([[0.0; K]; K]);
+        for i in 0..K {
+            for j in 0..K {
+                m_low[i][j] = snap.m_low_flat[i * K + j];
+            }
+        }
+        me.m_low = m_low;
+        me.t = snap.t;
+        me.warmup = snap.warmup;
+        me.gamma = snap.gamma;
+        me.eta_base = snap.eta_base;
+        me.cached_spectral_gap = snap.cached_spectral_gap;
+        me.confidence_refresh_every = snap.confidence_refresh_every;
+        Ok(me)
+    }
+
     fn feature_of(&self, event: EventId) -> Option<&[f32; K]> {
         self.event_features.get(&event)
     }
@@ -340,6 +426,23 @@ fn project_centered<const K: usize>(
         }
     }
     out
+}
+
+/// On-disk snapshot for [`LowRankSrPredictor`]. The projection matrix
+/// and event features are NOT serialized (corpus-dependent; rebuilt
+/// from the matching `event_centroids` at load time). `M_low` is
+/// serialized as a flat `Vec<f32>` of length K*K, row-major.
+#[derive(Serialize, Deserialize)]
+struct LowRankSnapshot {
+    k: usize,
+    t: u64,
+    warmup: u64,
+    gamma: f32,
+    eta_base: f32,
+    normalize_features: bool,
+    cached_spectral_gap: f32,
+    confidence_refresh_every: u64,
+    m_low_flat: Vec<f32>,
 }
 
 /// v0.2.7 fix: L2-normalize a feature vector so PCA-projected features
@@ -693,6 +796,52 @@ mod tests {
         }
         let preds = p.predict(&[ev(0)], 3);
         assert!(!preds.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let centroids = three_event_centroids();
+        let mut sr: LowRankSr = LowRankSr::new(&centroids).with_gamma(0.7).with_warmup(15);
+        for _ in 0..30 {
+            sr.observe(ev(0), ev(1));
+            sr.observe(ev(1), ev(2));
+        }
+        let before_m00 = sr.m_low(0, 0);
+        let before_m01 = sr.m_low(0, 1);
+        let before_t = sr.observations();
+
+        let path = std::env::temp_dir().join("primd-low-rank-roundtrip.json");
+        sr.save_to_file(&path).unwrap();
+        let loaded: LowRankSr = LowRankSr::load_from_file(&path, &centroids).unwrap();
+
+        assert_eq!(loaded.observations(), before_t);
+        assert!((loaded.gamma() - 0.7).abs() < 1e-6);
+        assert!((loaded.m_low(0, 0) - before_m00).abs() < 1e-6);
+        assert!((loaded.m_low(0, 1) - before_m01).abs() < 1e-6);
+
+        // Verify predictions match after round-trip.
+        let preds_before = sr.predict(&[ev(0)], 2);
+        let preds_after = loaded.predict(&[ev(0)], 2);
+        assert_eq!(preds_before.len(), preds_after.len());
+        for (a, b) in preds_before.iter().zip(preds_after.iter()) {
+            assert_eq!(a.event, b.event);
+            assert!((a.probability - b.probability).abs() < 1e-5);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_rejects_wrong_k() {
+        let centroids = three_event_centroids();
+        let sr_k32: LowRankSrPredictor<32> = LowRankSrPredictor::<32>::new(&centroids);
+        let path = std::env::temp_dir().join("primd-low-rank-wrong-k.json");
+        sr_k32.save_to_file(&path).unwrap();
+        // Loading into K=64 should error with InvalidData.
+        match LowRankSrPredictor::<64>::load_from_file(&path, &centroids) {
+            Ok(_) => panic!("expected K-mismatch error"),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
+        }
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
