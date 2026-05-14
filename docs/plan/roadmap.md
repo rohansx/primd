@@ -57,7 +57,7 @@ References: Dayan 1993, Stachenfeld et al. 2017 (Nat Neurosci 20:1643–1653), R
 
 ### Track B — Real per-event HNSW shards
 
-The current event-scoped path is a SIMD gather + subset rescan, not HNSW. Works well up to ~1 M docs with small union scopes; degrades past that. v0.2 adds an actual per-event HNSW graph using `instant-distance` or `hnsw_rs`. The trait surface in `shards.rs` already isolates the rescan step, so the change is localized.
+✅ Shipped 2026-05-14. New `primd-core::index::hnsw::EventHnswCache` builds per-event HNSW shards via `instant-distance` lazily on first query. `HierarchicalIndex::with_hnsw()` opts in; `search()` routes to HNSW when the union scope ≥ 1024 docs, else falls through to the v0.2 SIMD subset rescan. Gated behind the `hnsw` feature flag (on by default). 5 new unit tests cover build correctness, threshold gating, unknown-event fallback, and shard caching across queries. v0.3.1 will add on-disk persistence so shards survive `primd serve` restarts.
 
 ### Track C — MoshiRAG back-end adapter
 

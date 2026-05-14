@@ -21,11 +21,16 @@ serde.workspace = true
 serde_json.workspace = true
 ureq = { workspace = true, optional = true }
 fastembed = { workspace = true, optional = true }
+instant-distance = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand.workspace = true
 
 [features]
-default = []
+default = ["hnsw"]
 openai = ["dep:ureq"]
 local = ["dep:fastembed"]
+# Per-event HNSW shards via instant-distance. v0.3 deliverable promised
+# in roadmap. Off-default would defer the dep cost; default-on because
+# the cost is tiny and the API benefits feature parity.
+hnsw = ["dep:instant-distance"]

@@ -1,4 +1,6 @@
 use super::events::EventCatalog;
+#[cfg(feature = "hnsw")]
+use super::hnsw::{EventHnswCache, HnswBuildOptions};
 use super::signatures::SignatureIndex;
 use crate::embed::binary::BinarySignature;
 use crate::predict::EventId;
@@ -32,11 +34,41 @@ pub struct SearchResult {
 pub struct HierarchicalIndex {
     signatures: SignatureIndex,
     events: EventCatalog,
+    #[cfg(feature = "hnsw")]
+    hnsw: Option<EventHnswCache>,
 }
 
 impl HierarchicalIndex {
     pub fn new(signatures: SignatureIndex, events: EventCatalog) -> Self {
-        Self { signatures, events }
+        Self {
+            signatures,
+            events,
+            #[cfg(feature = "hnsw")]
+            hnsw: None,
+        }
+    }
+
+    /// Enable per-event HNSW shards. v0.3 path that replaces the
+    /// SIMD-subset-rescan when the candidate-event union scope is
+    /// large enough that linear rescan dominates. Shards are built
+    /// lazily on first query touching an event.
+    #[cfg(feature = "hnsw")]
+    pub fn with_hnsw(mut self, options: HnswBuildOptions) -> Self {
+        let docs: Vec<BinarySignature> = self.signatures.as_slice().to_vec();
+        let scopes = self.events.scope_map().clone();
+        self.hnsw = Some(EventHnswCache::new(docs, scopes, options));
+        self
+    }
+
+    /// Whether HNSW shards have been enabled on this index. False
+    /// when the feature is compiled out or `with_hnsw` was not called.
+    #[cfg(feature = "hnsw")]
+    pub fn hnsw_enabled(&self) -> bool {
+        self.hnsw.is_some()
+    }
+    #[cfg(not(feature = "hnsw"))]
+    pub fn hnsw_enabled(&self) -> bool {
+        false
     }
 
     pub fn signatures(&self) -> &SignatureIndex {
@@ -96,6 +128,31 @@ impl HierarchicalIndex {
                 shard_scope_size: self.signatures.len(),
                 used_shards: false,
             };
+        }
+
+        // HNSW shard path. Engages only when the scope is large enough
+        // that linear subset-rescan starts to dominate. For typical
+        // voice-corpus event sizes (1k–5k docs) the SIMD rescan is
+        // already sub-microsecond; HNSW pays off at 5k–10k+.
+        #[cfg(feature = "hnsw")]
+        {
+            if let Some(cache) = &self.hnsw
+                && cache.is_worth_hnsw(scope.len())
+            {
+                let mut merged: Vec<(u32, usize)> = Vec::new();
+                for &event in &candidate_events {
+                    merged.extend(cache.search(event, query, top_k));
+                }
+                merged.sort_by_key(|&(d, _)| d);
+                merged.truncate(top_k);
+                return SearchResult {
+                    results: merged,
+                    coarse_results,
+                    candidate_events,
+                    shard_scope_size: scope.len(),
+                    used_shards: true,
+                };
+            }
         }
 
         let results = if options.parallel {

@@ -84,20 +84,21 @@ The coarse top-K hits are mapped to candidate events; the union of those events'
 | `max_candidate_events` | 8 | Cap on how many distinct events the coarse hits can resolve to |
 | `parallel` | true | Use rayon for the coarse and subset scans |
 
-### Stage 2b v0.2 — Real per-event HNSW shards (planned)
+### Stage 2b — Real per-event HNSW shards (shipped 2026-05-14)
 
-For corpora where the union scope exceeds ~5–10 k docs (large multi-tenant deployments, very long sessions with broad scope unions), the subset rescan starts to dominate. v0.2 will add an actual HNSW graph per event, indexed by the float32 embeddings of the event's docs:
+For corpora where the union scope exceeds ~1 k docs (large multi-tenant deployments, very long sessions with broad scope unions), the subset rescan starts to dominate. The `hnsw` feature flag (on by default) adds per-event HNSW shards via [`instant-distance`](https://crates.io/crates/instant-distance):
 
+```rust
+use primd_core::index::shards::HierarchicalIndex;
+use primd_core::index::hnsw::HnswBuildOptions;
+
+let index = HierarchicalIndex::new(signatures, events)
+    .with_hnsw(HnswBuildOptions::default()); // ef_construction=100, ef_search=64
 ```
-events/
-├── 0000.hnsw       # per-event HNSW graph (mmap-able)
-├── 0000.vecs       # per-event float32 vectors (mmap-able)
-├── 0001.hnsw
-├── 0001.vecs
-└── ...
-```
 
-Searching a 1–10 k-node HNSW shard takes ~0.3–0.5 ms with excellent cache behavior. Likely impl: `instant-distance` or `hnsw_rs`. The trait surface in `shards.rs` already isolates the rescan step, so this is a localized change.
+Hamming distance is exposed to instant-distance via a `SignaturePoint` wrapper. Shards are **lazy** — built on first query touching an event, cached for subsequent queries. Threshold (`min_shard_size`, default 1024) below which the index falls back to subset-rescan because the HNSW build cost (~10 ms per shard) isn't worth amortizing.
+
+On-disk persistence (`events/NNNN.hnsw`) is v0.3.1 work — current shards rebuild on `primd serve` startup. For 100-event corpora at 100 k docs the cold build is ~1–2 s total; subsequent startups will use cached shards once persistence lands.
 
 ## Event boundary detection
 

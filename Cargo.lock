@@ -2040,6 +2040,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "fastembed",
+ "instant-distance",
  "memmap2",
  "rand 0.9.4",
  "rayon",
